@@ -155,3 +155,65 @@ func TestReviewLeavingNodeIsNotARedirectTarget(t *testing.T) {
 		t.Fatalf("adopted %d after release, want 1", len(got))
 	}
 }
+
+// Seventh review: a node took over matches whatever their snapshot format; during a
+// rolling deploy that changes it, a node of one version would take matches it cannot run.
+// With an adopt filter it leaves them to a node that can.
+func TestReviewAdoptLeavesUnrunnableSnapshots(t *testing.T) {
+	ctx := context.Background()
+	mr, n := clusterNodes(t, "dead", "old", "new")
+	for id, data := range map[string]string{"m-v1": "v1", "m-v2": "v2"} {
+		if err := n["dead"].Save(ctx, id, []byte(data)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	mr.FastForward(lease + time.Second)
+	_ = n["old"].Heartbeat(ctx, lease)
+	_ = n["new"].Heartbeat(ctx, lease)
+	n["old"].SetAdoptFilter(func(d []byte) bool { return string(d) == "v1" })
+	got, err := n["old"].AdoptOrphans(ctx, 10)
+	if err != nil || len(got) != 1 || string(got["m-v1"]) != "v1" {
+		t.Fatalf("old node adopted %v (err %v), want only m-v1", got, err)
+	}
+	if got, _ := n["new"].AdoptOrphans(ctx, 10); len(got) != 1 || string(got["m-v2"]) != "v2" {
+		t.Fatalf("new node adopted %v, want the m-v2 the old node left", got)
+	}
+}
+
+// Seventh review: the adopt lock of a dead node was deleted unconditionally at the end of
+// a scan, even if it had expired meanwhile and now belonged to another node.
+func TestReviewAdoptLockReleasedOnlyByItsHolder(t *testing.T) {
+	ctx := context.Background()
+	mr, n := clusterNodes(t, "b")
+	_ = mr.Set("c:adopt:dead", "other-node")
+	releaseLockScript.Run(ctx, n["b"].rdb, []string{"c:adopt:dead"}, "b")
+	if !mr.Exists("c:adopt:dead") {
+		t.Fatal("a node released an adopt lock held by another node")
+	}
+	_ = mr.Set("c:adopt:dead", "b")
+	releaseLockScript.Run(ctx, n["b"].rdb, []string{"c:adopt:dead"}, "b")
+	if mr.Exists("c:adopt:dead") {
+		t.Fatal("a node did not release its own adopt lock")
+	}
+}
+
+// Seventh review: node ids were not checked, but the owner value is "<node> <url>" and
+// tickets are tab-separated.
+func TestReviewNodeIDIsValidated(t *testing.T) {
+	for _, c := range []struct {
+		node, url string
+		ok        bool
+	}{
+		{"game-1", "ws://game-1:8080/ws", true},
+		{"pod.sabo_2", "wss://a.example/ws", true},
+		{"", "ws://x", false},
+		{"game 1", "ws://x", false},
+		{"game\t1", "ws://x", false},
+		{"game:1", "ws://x", false},
+		{"game-1", "ws://x /ws", false},
+	} {
+		if err := ValidateNode(c.node, c.url); (err == nil) != c.ok {
+			t.Errorf("ValidateNode(%q, %q) = %v, want ok=%v", c.node, c.url, err, c.ok)
+		}
+	}
+}

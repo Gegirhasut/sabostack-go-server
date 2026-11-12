@@ -14,12 +14,17 @@ import (
 	"github.com/redis/go-redis/v9"
 
 	"github.com/Gegirhasut/sabostack-go-server/internal/lobby"
+	"github.com/Gegirhasut/sabostack-go-server/internal/match"
 	"github.com/Gegirhasut/sabostack-go-server/internal/metrics"
 )
 
 // Matchmaker is a FIFO matchmaking queue shared by every node.
 //
-//   - A joining player's ticket "<id>\t<node>\t<name>" is pushed onto one Redis list.
+//   - A joining player's ticket "<id>\t<node>\t<token hash>\t<name>" is pushed onto one
+//     Redis list. The player's session token is made by the node the player is connected
+//     to and stays there: Redis (the queue, assignment records, pub/sub) only ever sees its
+//     hash, which is also all the match stores. Reading Redis is not enough to take a
+//     player's seat.
 //   - Any node pops the two oldest tickets in one Lua script, skipping tickets of nodes
 //     whose heartbeat has expired, and creates the match locally (it is alive, so it can
 //     host it).
@@ -46,7 +51,7 @@ type Matchmaker struct {
 	prefix string
 	node   string
 	url    string
-	create lobby.CreateFunc
+	create CreateFunc
 	met    *metrics.Metrics
 	log    *slog.Logger
 
@@ -60,8 +65,13 @@ type Matchmaker struct {
 	stopWG sync.WaitGroup
 }
 
+// CreateFunc starts a match for two players identified by their token hashes and returns
+// its id (match.Manager.CreateWithTokenHashes).
+type CreateFunc func(names, tokenHashes [2]string) (string, error)
+
 type waiter struct {
 	id           string
+	token        string // the player's session token; never leaves this node
 	t            *lobby.Ticket
 	raw          string
 	missingSince time.Time // popped but not assigned yet; zero while queued
@@ -72,7 +82,6 @@ type assignMsg struct {
 	Ticket   string `json:"ticket"`
 	MatchID  string `json:"matchId"`
 	Seat     int    `json:"seat"`
-	Token    string `json:"token"`
 	Opponent string `json:"opponent"`
 	URL      string `json:"url"`
 }
@@ -115,7 +124,7 @@ return picked
 
 // NewMatchmaker starts the subscription and the background pairing loop. create starts a
 // match on this node. url is this node's public WebSocket URL.
-func NewMatchmaker(rdb redis.UniversalClient, prefix, node, url string, create lobby.CreateFunc, met *metrics.Metrics, log *slog.Logger) (*Matchmaker, error) {
+func NewMatchmaker(rdb redis.UniversalClient, prefix, node, url string, create CreateFunc, met *metrics.Metrics, log *slog.Logger) (*Matchmaker, error) {
 	m := &Matchmaker{
 		rdb: rdb, prefix: prefix, node: node, url: url, create: create, met: met, log: log,
 		waiting: map[string]*waiter{}, byT: map[*lobby.Ticket]string{}, stop: make(chan struct{}),
@@ -134,7 +143,10 @@ func NewMatchmaker(rdb redis.UniversalClient, prefix, node, url string, create l
 	return m, nil
 }
 
-func (m *Matchmaker) queueKey() string           { return m.prefix + "mm:queue" }
+// The queue key is versioned with the ticket format: during a rolling deploy, nodes of
+// the old and the new format pair players in separate queues instead of misreading each
+// other's tickets.
+func (m *Matchmaker) queueKey() string           { return m.prefix + "mm:queue:v2" }
 func (m *Matchmaker) channel(node string) string { return m.prefix + "mm:to:" + node }
 func (m *Matchmaker) alivePrefix() string        { return m.prefix + "alive:" }
 func (m *Matchmaker) claimKey(id string) string  { return m.prefix + "mm:claim:" + id }
@@ -150,7 +162,8 @@ func ticketID() string {
 func (m *Matchmaker) JoinContext(ctx context.Context, name string) *lobby.Ticket {
 	t := lobby.NewTicket(ctx, name)
 	id := ticketID()
-	w := &waiter{id: id, t: t, raw: id + "\t" + m.node + "\t" + name}
+	token := match.NewToken()
+	w := &waiter{id: id, token: token, t: t, raw: id + "\t" + m.node + "\t" + match.HashToken(token) + "\t" + name}
 	m.mu.Lock()
 	if m.closed {
 		m.mu.Unlock()
@@ -266,14 +279,14 @@ func (m *Matchmaker) tryPair(ctx context.Context) {
 	}
 }
 
-type ticket struct{ id, node, name string }
+type ticket struct{ id, node, tokenHash, name string }
 
 func parseTicket(raw string) (ticket, bool) {
-	f := strings.SplitN(raw, "\t", 3)
-	if len(f) != 3 {
+	f := strings.SplitN(raw, "\t", 4)
+	if len(f) != 4 {
 		return ticket{}, false
 	}
-	return ticket{f[0], f[1], f[2]}, true
+	return ticket{f[0], f[1], f[2], f[3]}, true
 }
 
 // start hosts a match for two popped tickets and tells both players where it is.
@@ -284,7 +297,7 @@ func (m *Matchmaker) start(ctx context.Context, pair []string) {
 		m.log.Warn("dropping malformed matchmaking tickets", "a", pair[0], "b", pair[1])
 		return
 	}
-	id, tokens, err := m.create([2]string{a.name, b.name})
+	id, err := m.create([2]string{a.name, b.name}, [2]string{a.tokenHash, b.tokenHash})
 	if err != nil {
 		// Cannot host (shutting down): give the pair back, oldest first, to another node.
 		m.rdb.LPush(ctx, m.queueKey(), pair[1], pair[0])
@@ -293,7 +306,7 @@ func (m *Matchmaker) start(ctx context.Context, pair []string) {
 	}
 	for seat, t := range []ticket{a, b} {
 		opp := []ticket{b, a}[seat]
-		as := assignMsg{Ticket: t.id, MatchID: id, Seat: seat, Token: tokens[seat], Opponent: opp.name}
+		as := assignMsg{Ticket: t.id, MatchID: id, Seat: seat, Opponent: opp.name}
 		if t.node == m.node {
 			m.met.Matchmaking.WithLabelValues("local").Inc()
 			m.deliver(as)
@@ -320,7 +333,7 @@ func (m *Matchmaker) deliver(as assignMsg) {
 		m.met.Matchmaking.WithLabelValues("stale").Inc() // the player left meanwhile
 		return
 	}
-	w.t.Deliver(lobby.Assignment{MatchID: as.MatchID, Seat: as.Seat, Token: as.Token, Opponent: as.Opponent, URL: as.URL})
+	w.t.Deliver(lobby.Assignment{MatchID: as.MatchID, Seat: as.Seat, Token: w.token, Opponent: as.Opponent, URL: as.URL})
 }
 
 func (m *Matchmaker) receive() {

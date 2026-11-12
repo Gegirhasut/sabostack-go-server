@@ -5,10 +5,12 @@ package match
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
 	"log/slog"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -246,5 +248,75 @@ func TestReviewAwaitedWritesDoNotStarveRoutineOnes(t *testing.T) {
 	}
 	if routine < opts.PersistBatch/2 {
 		t.Fatalf("first batch after the burst had %d routine writes of %d: %v", routine, opts.PersistBatch, st.order[1:1+opts.PersistBatch])
+	}
+}
+
+// withVersion rewrites a snapshot's version field.
+func withVersion(t *testing.T, data []byte, v int) []byte {
+	t.Helper()
+	var m map[string]json.RawMessage
+	if err := json.Unmarshal(data, &m); err != nil {
+		t.Fatal(err)
+	}
+	m["version"] = json.RawMessage(strconv.Itoa(v))
+	out, err := json.Marshal(m)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return out
+}
+
+// Seventh review: any snapshot Restore could not read was deleted, and a version
+// mismatch counted as unreadable. The first deploy that changed the format would have
+// had restarting nodes delete their own final snapshots, and new nodes delete the matches
+// they took over from old ones: every live match lost exactly when recovery should save
+// it. Snapshots of an unknown version are now left alone.
+func TestReviewUnknownSnapshotVersionIsKept(t *testing.T) {
+	cfg := testConfig()
+	m, _ := New("future", cfg, [2]string{"a", "b"}, 1, t0)
+	data, err := m.FinalSnapshot(t0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	newer := withVersion(t, data, snapshotVersion+1)
+	if SnapshotSupported(newer) || !SnapshotSupported(data) {
+		t.Fatal("SnapshotSupported does not tell the versions apart")
+	}
+
+	st := laggyStore{newPlain()}
+	_ = st.mem.Save(context.Background(), "future", newer)
+	mgr := NewManager(DefaultOptions(), clock.Real{}, st, metrics.New(prometheus.NewRegistry()), slog.New(slog.NewTextHandler(io.Discard, nil)))
+	defer mgr.Shutdown(context.Background())
+	if n, err := mgr.Restore(context.Background()); err != nil || n != 0 {
+		t.Fatalf("restored %d (err %v) from a snapshot of an unknown version", n, err)
+	}
+	if n := mgr.Adopt(map[string][]byte{"future": newer}); n != 0 {
+		t.Fatalf("adopted %d from a snapshot of an unknown version", n)
+	}
+	time.Sleep(50 * time.Millisecond) // a delete would have been queued by now
+	all, _ := st.LoadAll(context.Background())
+	if string(all["future"]) != string(newer) {
+		t.Fatal("a snapshot of an unknown version was deleted; a node of that version needed it")
+	}
+}
+
+// The other half of the fix: a build that bumps the version registers a migration from
+// the previous one, and the previous build's snapshots still restore.
+func TestReviewSnapshotMigrationFromPreviousVersion(t *testing.T) {
+	m, _ := New("old", testConfig(), [2]string{"a", "b"}, 1, t0)
+	data, _ := m.FinalSnapshot(t0)
+	old := withVersion(t, data, snapshotVersion-1)
+	if _, err := Restore(old, testConfig(), t0); !errors.Is(err, ErrSnapshotVersion) {
+		t.Fatalf("no migration registered: err = %v, want ErrSnapshotVersion", err)
+	}
+	called := false
+	snapshotMigrations[snapshotVersion-1] = func(raw json.RawMessage) (json.RawMessage, error) {
+		called = true
+		return raw, nil
+	}
+	defer delete(snapshotMigrations, snapshotVersion-1)
+	r, err := Restore(old, testConfig(), t0)
+	if err != nil || !called || r.ID != "old" {
+		t.Fatalf("restore through migration: err=%v called=%v", err, called)
 	}
 }

@@ -6,6 +6,9 @@ import (
 	"context"
 	"io"
 	"log/slog"
+	"slices"
+	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -140,10 +143,10 @@ func shortRequeue(t *testing.T) {
 }
 
 // popAsRemote takes the oldest ticket out of the queue the way another node's pair script
-// would, claiming it for that node. It returns the ticket id.
-func popAsRemote(t *testing.T, e *mmEnv, node string) string {
+// would, claiming it for that node. It returns the ticket.
+func popAsRemote(t *testing.T, e *mmEnv, node string) ticket {
 	t.Helper()
-	raw, err := e.rdb.LPop(context.Background(), "t:mm:queue").Result()
+	raw, err := e.rdb.LPop(context.Background(), "t:mm:queue:v2").Result()
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -152,11 +155,11 @@ func popAsRemote(t *testing.T, e *mmEnv, node string) string {
 		t.Fatalf("bad ticket %q", raw)
 	}
 	e.mr.Set("t:mm:claim:"+tk.id, node)
-	return tk.id
+	return tk
 }
 
 func queueLen(e *mmEnv) int64 {
-	n, _ := e.rdb.LLen(context.Background(), "t:mm:queue").Result()
+	n, _ := e.rdb.LLen(context.Background(), "t:mm:queue:v2").Result()
 	return n
 }
 
@@ -170,13 +173,15 @@ func TestReviewLostAssignmentMessageIsRecovered(t *testing.T) {
 	n1 := e.node(t, "n1")
 	e.mr.Set("t:alive:n2", "ws://n2")
 	tk := n1.JoinContext(context.Background(), "alice")
-	id := popAsRemote(t, e, "n2")
+	popped := popAsRemote(t, e, "n2")
+	id := popped.id
 	// n2 created the match and recorded the assignment; its publish never arrived.
-	e.mr.Set("t:mm:assign:"+id, `{"ticket":"`+id+`","matchId":"n2-m1","seat":1,"token":"tok","opponent":"bob","url":"ws://n2"}`)
+	e.mr.Set("t:mm:assign:"+id, `{"ticket":"`+id+`","matchId":"n2-m1","seat":1,"opponent":"bob","url":"ws://n2"}`)
 
 	select {
 	case a := <-tk.C():
-		if a.MatchID != "n2-m1" || a.URL != "ws://n2" || a.Token != "tok" {
+		// The token is the one this node made; the host only ever had its hash.
+		if a.MatchID != "n2-m1" || a.URL != "ws://n2" || match.HashToken(a.Token) != popped.tokenHash {
 			t.Fatalf("recovered assignment %+v", a)
 		}
 	case <-time.After(10 * requeueAfter):
@@ -279,8 +284,8 @@ func TestReviewGoneTicketAfterPopIsForgotten(t *testing.T) {
 	e.mr.Set("t:alive:n2", "ws://n2")
 	ctxRec, leaveRec := context.WithCancel(context.Background())
 	n1.JoinContext(ctxRec, "recorded")
-	id := popAsRemote(t, e, "n2")
-	e.mr.Set("t:mm:assign:"+id, `{"ticket":"`+id+`","matchId":"n2-m1","seat":0,"token":"tok","opponent":"x","url":"ws://n2"}`)
+	id := popAsRemote(t, e, "n2").id
+	e.mr.Set("t:mm:assign:"+id, `{"ticket":"`+id+`","matchId":"n2-m1","seat":0,"opponent":"x","url":"ws://n2"}`)
 	leaveRec()
 
 	deadline := time.Now().Add(20 * checkLostEvery)
@@ -310,5 +315,76 @@ func TestReviewTicketOfPlayerWhoLeftDuringJoinIsNotQueued(t *testing.T) {
 	}
 	if w := waiting(n1); w != 0 {
 		t.Fatalf("%d waiter(s) left for a player who already left", w)
+	}
+}
+
+// Seventh review: a player's session token was written to Redis in plain text (the
+// assignment record and the pub/sub message), although matches deliberately store only
+// its hash; anyone able to read Redis or run MONITOR could take a player's seat. Tokens
+// are now made by the player's own node and never leave it.
+func TestReviewTokensNeverReachRedis(t *testing.T) {
+	e := newEnv(t)
+	sub := e.rdb.PSubscribe(context.Background(), "t:*")
+	defer sub.Close()
+	if _, err := sub.Receive(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	var published []string
+	var pubMu sync.Mutex
+	go func() {
+		for msg := range sub.Channel() {
+			pubMu.Lock()
+			published = append(published, msg.Payload)
+			pubMu.Unlock()
+		}
+	}()
+
+	n1, n2 := e.node(t, "n1"), e.node(t, "n2")
+	alice := n1.JoinContext(context.Background(), "alice")
+	bob := n2.JoinContext(context.Background(), "bob")
+	ga, gb := wait(t, alice), wait(t, bob)
+	if ga.Token == "" || gb.Token == "" || ga.Token == gb.Token {
+		t.Fatalf("tokens %q / %q", ga.Token, gb.Token)
+	}
+	e.mu.Lock()
+	hashes := append([]string(nil), e.hashes...)
+	e.mu.Unlock()
+	for _, tok := range []string{ga.Token, gb.Token} {
+		if !slices.Contains(hashes, match.HashToken(tok)) {
+			t.Fatalf("the host was not given the hash of token %q: %v", tok, hashes)
+		}
+	}
+	time.Sleep(50 * time.Millisecond) // let pub/sub deliveries land
+
+	ctx := context.Background()
+	var everything []string
+	keys, _ := e.rdb.Keys(ctx, "*").Result()
+	for _, k := range keys {
+		switch typ, _ := e.rdb.Type(ctx, k).Result(); typ {
+		case "string":
+			v, _ := e.rdb.Get(ctx, k).Result()
+			everything = append(everything, k+"="+v)
+		case "list":
+			v, _ := e.rdb.LRange(ctx, k, 0, -1).Result()
+			everything = append(everything, k+"="+strings.Join(v, ","))
+		case "set":
+			v, _ := e.rdb.SMembers(ctx, k).Result()
+			everything = append(everything, k+"="+strings.Join(v, ","))
+		default:
+			everything = append(everything, k+"=<"+typ+">")
+		}
+	}
+	pubMu.Lock()
+	if len(published) == 0 {
+		t.Error("no pub/sub message seen: the cross-node assignment was not published")
+	}
+	everything = append(everything, published...)
+	pubMu.Unlock()
+	for _, tok := range []string{ga.Token, gb.Token} {
+		for _, v := range everything {
+			if strings.Contains(v, tok) {
+				t.Fatalf("session token %q is readable in Redis: %s", tok, v)
+			}
+		}
 	}
 }

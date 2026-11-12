@@ -129,9 +129,30 @@ var ErrShuttingDown = errors.New("match: server shutting down")
 func (m *Manager) Create(names [2]string) (string, [2]string, error) {
 	id := randomID()
 	mt, tokens := New(id, m.opts.Match, names, randomSeed(), m.clock.Now())
+	if err := m.announce(mt); err != nil {
+		return "", [2]string{}, err
+	}
+	m.log.Info("match created", "match", id, "p0", names[0], "p1", names[1])
+	return id, tokens, nil
+}
+
+// CreateWithTokenHashes starts a match for players whose tokens were made elsewhere (the
+// cluster matchmaker: each player's own node keeps the token, see NewWithTokenHashes).
+func (m *Manager) CreateWithTokenHashes(names, tokenHashes [2]string) (string, error) {
+	id := randomID()
+	mt := NewWithTokenHashes(id, m.opts.Match, names, tokenHashes, randomSeed(), m.clock.Now())
+	if err := m.announce(mt); err != nil {
+		return "", err
+	}
+	m.log.Info("match created", "match", id, "p0", names[0], "p1", names[1])
+	return id, nil
+}
+
+// announce starts a new match and returns once it may be announced to its players.
+func (m *Manager) announce(mt *Match) error {
 	a := m.start(mt, true)
 	if a == nil {
-		return "", [2]string{}, ErrShuttingDown
+		return ErrShuttingDown
 	}
 	// Announce the match only after its first snapshot write has been attempted. Before,
 	// players were told about it while the write was still queued: a resume reaching
@@ -146,11 +167,10 @@ func (m *Manager) Create(names [2]string) (string, [2]string, error) {
 	<-a.stored
 	select {
 	case <-a.Done(): // stopped before it was announced (shutdown, or the store says another node owns it)
-		return "", [2]string{}, ErrStopped
+		return ErrStopped
 	default:
 	}
-	m.log.Info("match created", "match", id, "p0", names[0], "p1", names[1])
-	return id, tokens, nil
+	return nil
 }
 
 // Get returns the actor for a match id.
@@ -189,9 +209,14 @@ func (m *Manager) Restore(ctx context.Context) (int, error) {
 			continue // Restore again after a lost cluster lease: only what is missing
 		}
 		mt, err := Restore(data, m.opts.Match, m.clock.Now())
-		if err != nil || mt.Phase == MatchEnd {
-			m.log.Warn("discarding snapshot", "match", id, "err", err)
-			_ = m.store.Delete(ctx, id)
+		switch {
+		case err != nil:
+			// Never delete what we cannot read: it may be a format a newer (or older)
+			// build of a rolling deploy can still run. The store's TTL removes it.
+			m.log.Error("cannot restore snapshot; leaving it in the store", "match", id, "err", err)
+			continue
+		case mt.Phase == MatchEnd:
+			_ = m.store.Delete(ctx, id) // finished: nothing left to restore
 			continue
 		}
 		if m.start(mt, false) == nil {
@@ -214,8 +239,13 @@ func (m *Manager) Adopt(snaps map[string][]byte) int {
 			continue
 		}
 		mt, err := Restore(data, m.opts.Match, m.clock.Now())
-		if err != nil || mt.Phase == MatchEnd {
-			m.log.Warn("discarding adopted snapshot", "match", id, "err", err)
+		switch {
+		case err != nil:
+			// The store's adopt filter (SnapshotSupported) keeps unknown formats from
+			// being taken over at all; anything else unreadable is kept, not deleted.
+			m.log.Error("cannot run adopted snapshot; leaving it in the store", "match", id, "err", err)
+			continue
+		case mt.Phase == MatchEnd:
 			m.enqueue(id, nil, false)
 			continue
 		}
@@ -408,6 +438,18 @@ func (m *Manager) enqueue(id string, data []byte, wait bool) <-chan struct{} {
 	return done
 }
 
+// routineWaiting reports whether any pending job is not urgent. (Every job is also in
+// order, urgent ones included, so len(order) alone says nothing.) Called with sh.mu held.
+func (sh *persistShard) routineWaiting() bool {
+	urgent := make(map[string]struct{}, len(sh.urgent))
+	for _, id := range sh.urgent {
+		if _, ok := sh.pending[id]; ok {
+			urgent[id] = struct{}{}
+		}
+	}
+	return len(sh.pending) > len(urgent)
+}
+
 // take moves pending jobs from the front of queue into jobs until it holds max, and
 // returns what is left of queue. Ids already written through the other list are skipped.
 // Called with sh.mu held.
@@ -452,7 +494,7 @@ func (m *Manager) persistLoop(sh *persistShard) {
 		// stream of new matches cannot starve the periodic snapshots of a shard; any room
 		// the routine ones leave goes back to urgent.
 		urgentShare := batch
-		if len(sh.order) > 0 {
+		if sh.routineWaiting() {
 			urgentShare = max(1, batch/2)
 		}
 		sh.urgent = sh.take(sh.urgent, &jobs, urgentShare)

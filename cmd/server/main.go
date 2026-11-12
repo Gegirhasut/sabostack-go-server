@@ -116,7 +116,13 @@ func run(log *slog.Logger, c config) error {
 		}
 		rs = store.NewRedis(rdb, c.prefix, c.redisTTL)
 		if c.nodeID != "" {
+			if err := store.ValidateNode(c.nodeID, c.publicURL); err != nil {
+				return err
+			}
 			rs = rs.ForNode(c.nodeID, c.publicURL)
+			// Take over only matches this build can run (rolling deploys that change the
+			// snapshot format).
+			rs.SetAdoptFilter(match.SnapshotSupported)
 			log.Info("using redis snapshot store", "addr", c.redisAddr, "node", c.nodeID)
 		} else {
 			log.Warn("using redis snapshot store without -node-id: only one server may use this Redis prefix", "addr", c.redisAddr)
@@ -160,7 +166,7 @@ func run(log *slog.Logger, c config) error {
 	srv = server.NewWithConfig(mgr, met, reg, log, c.srv)
 	if node != nil {
 		if c.sharedQueue {
-			mm, err := cluster.NewMatchmaker(rdb, c.prefix, c.nodeID, c.publicURL, mgr.Create, met, log)
+			mm, err := cluster.NewMatchmaker(rdb, c.prefix, c.nodeID, c.publicURL, mgr.CreateWithTokenHashes, met, log)
 			if err != nil {
 				return err
 			}

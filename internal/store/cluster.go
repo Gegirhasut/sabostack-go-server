@@ -97,6 +97,20 @@ redis.call('SADD', KEYS[4], ARGV[3])
 return data
 `)
 
+// SetAdoptFilter makes AdoptOrphans take over only the matches whose snapshot ok
+// accepts. During a rolling deploy that changes the snapshot format, a node must not take
+// a match it cannot run: it would sit, owned and unrun, until its TTL (match.SnapshotSupported).
+func (s *Redis) SetAdoptFilter(ok func(data []byte) bool) { s.adoptable = ok }
+
+// releaseLockScript deletes a lock only if it still holds our value: one that expired and
+// was taken by another node is not ours to remove.
+var releaseLockScript = redis.NewScript(`
+if redis.call('GET', KEYS[1]) == ARGV[1] then
+  return redis.call('DEL', KEYS[1])
+end
+return 0
+`)
+
 // AdoptOrphans implements Cluster.
 //
 // A node is dead when its alive key has expired. One adopter at a time works on a dead
@@ -129,7 +143,7 @@ func (s *Redis) AdoptOrphans(ctx context.Context, max int) (map[string][]byte, e
 			continue // another node is adopting this one
 		}
 		err = s.adoptFrom(ctx, dead, max-len(out), out)
-		s.rdb.Del(ctx, s.adoptKey(dead))
+		releaseLockScript.Run(ctx, s.rdb, []string{s.adoptKey(dead)}, s.node)
 		if err != nil {
 			return out, err
 		}
@@ -145,6 +159,24 @@ func (s *Redis) adoptFrom(ctx context.Context, dead string, n int, out map[strin
 	if len(ids) == 0 {
 		// Nothing left: forget the node (it re-registers itself if it comes back).
 		return s.rdb.SRem(ctx, s.nodesKey(), dead).Err()
+	}
+	if s.adoptable != nil {
+		// Look before taking: matches in a format this node cannot run stay with the dead
+		// node for one that can. The owner check in the script still guards the move.
+		datas, err := s.rdb.MGet(ctx, s.keys(ids)...).Result()
+		if err != nil {
+			return err
+		}
+		kept := ids[:0]
+		for i, d := range datas {
+			if v, ok := d.(string); ok && !s.adoptable([]byte(v)) {
+				continue
+			}
+			kept = append(kept, ids[i]) // runnable, or gone (the script cleans it up)
+		}
+		if ids = kept; len(ids) == 0 {
+			return nil
+		}
 	}
 	cmds := make([]*redis.Cmd, len(ids))
 	ttl := s.ttl.Milliseconds()

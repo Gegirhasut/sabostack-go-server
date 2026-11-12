@@ -3,9 +3,11 @@ package store
 import (
 	"context"
 	"errors"
+	"fmt"
 	"strings"
 	"sync/atomic"
 	"time"
+	"unicode"
 
 	"github.com/redis/go-redis/v9"
 )
@@ -33,6 +35,9 @@ type Redis struct {
 	// leaving is set by Leaving: this node is shutting down and must not be advertised
 	// as a redirect target any more (shared by the copies ForNode hands out).
 	leaving *atomic.Bool
+	// adoptable, if set, tells AdoptOrphans which snapshots this node can run; the others
+	// are left with their dead owner for a node that can (see SetAdoptFilter).
+	adoptable func(data []byte) bool
 }
 
 // NewRedis wraps a client in legacy single-node mode. ttl bounds how long an orphaned
@@ -43,6 +48,24 @@ func NewRedis(rdb redis.UniversalClient, prefix string, ttl time.Duration) *Redi
 
 // ForNode returns a copy of s in node mode: matches are owned by node, and clients that
 // reach another server are redirected to publicURL.
+// ValidateNode checks a node id and public URL before they are written into Redis. The
+// owner value is "<node> <url>" and matchmaking tickets are tab-separated, so whitespace
+// in either would make other nodes misread them; ids are also used inside key names.
+func ValidateNode(node, publicURL string) error {
+	if node == "" || len(node) > 64 {
+		return fmt.Errorf("node id %q: must be 1-64 characters", node)
+	}
+	for _, r := range node {
+		if !(r >= 'a' && r <= 'z' || r >= 'A' && r <= 'Z' || r >= '0' && r <= '9' || r == '-' || r == '_' || r == '.') {
+			return fmt.Errorf("node id %q: only letters, digits, '-', '_' and '.' are allowed", node)
+		}
+	}
+	if strings.ContainsFunc(publicURL, unicode.IsSpace) {
+		return fmt.Errorf("public url %q: must not contain whitespace", publicURL)
+	}
+	return nil
+}
+
 func (s *Redis) ForNode(node, publicURL string) *Redis {
 	c := *s
 	c.node, c.url = node, publicURL
@@ -53,7 +76,15 @@ func (s *Redis) ForNode(node, publicURL string) *Redis {
 // chunk bounds MGET sizes so a restore never sends one giant command.
 const chunk = 500
 
-func (s *Redis) key(id string) string      { return s.prefix + "match:" + id }
+func (s *Redis) key(id string) string { return s.prefix + "match:" + id }
+
+func (s *Redis) keys(ids []string) []string {
+	out := make([]string, len(ids))
+	for i, id := range ids {
+		out[i] = s.key(id)
+	}
+	return out
+}
 func (s *Redis) ownerKey(id string) string { return s.prefix + "owner:" + id }
 func (s *Redis) setKey() string {
 	if s.node == "" {

@@ -39,6 +39,7 @@ func startClusterServer(t *testing.T, mr *testredis.R, name string) *clusterServ
 	hs := httptest.NewUnstartedServer(nil)
 	url := "ws://" + hs.Listener.Addr().String() + "/ws"
 	st := store.NewRedis(rdb, "k:", time.Hour).ForNode(name, url)
+	st.SetAdoptFilter(match.SnapshotSupported)
 
 	reg := prometheus.NewRegistry()
 	met := metrics.New(reg)
@@ -52,7 +53,7 @@ func startClusterServer(t *testing.T, mr *testredis.R, name string) *clusterServ
 	if err := node.Join(context.Background()); err != nil {
 		t.Fatal(err)
 	}
-	mm, err := cluster.NewMatchmaker(rdb, "k:", name, url, mgr.Create, met, log)
+	mm, err := cluster.NewMatchmaker(rdb, "k:", name, url, mgr.CreateWithTokenHashes, met, log)
 	if err != nil {
 		t.Fatal(err)
 	}

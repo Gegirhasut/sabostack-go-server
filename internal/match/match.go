@@ -136,14 +136,20 @@ func (m *Match) Rev() uint64 { return m.rev }
 
 // New creates a match in the Waiting phase and returns the session tokens for both seats.
 func New(id string, cfg Config, names [2]string, seed uint64, now time.Time) (*Match, [2]string) {
+	tokens := [2]string{NewToken(), NewToken()}
+	return NewWithTokenHashes(id, cfg, names, [2]string{HashToken(tokens[0]), HashToken(tokens[1])}, seed, now), tokens
+}
+
+// NewWithTokenHashes creates a match whose players hold tokens this process never sees:
+// only their hashes (HashToken). In a cluster the token is made by the node the player is
+// connected to and never leaves it; the hosting node gets the hash.
+func NewWithTokenHashes(id string, cfg Config, names, tokenHashes [2]string, seed uint64, now time.Time) *Match {
 	m := &Match{ID: id, Seed: seed, Phase: Waiting, Winner: NoSeat, cfg: cfg, PhaseEnds: now.Add(cfg.JoinTimeout)}
-	var tokens [2]string
 	for i := range m.Seats {
-		tokens[i] = newToken()
-		m.Seats[i] = &Seat{Name: names[i], TokenHash: hashToken(tokens[i])}
+		m.Seats[i] = &Seat{Name: names[i], TokenHash: tokenHashes[i]}
 	}
 	m.newBoards()
-	return m, tokens
+	return m
 }
 
 // SetConfig replaces the (unexported, non-persisted) config, e.g. after a restore.
@@ -544,7 +550,7 @@ func (m *Match) ConnectedCount() int {
 }
 
 func (m *Match) seatByToken(token string) int {
-	h := []byte(hashToken(token))
+	h := []byte(HashToken(token))
 	for i, s := range m.Seats {
 		if subtle.ConstantTimeCompare(h, []byte(s.TokenHash)) == 1 {
 			return i
@@ -553,7 +559,8 @@ func (m *Match) seatByToken(token string) int {
 	return NoSeat
 }
 
-func newToken() string {
+// NewToken returns a new random session token.
+func NewToken() string {
 	var b [16]byte
 	if _, err := rand.Read(b[:]); err != nil {
 		panic(fmt.Sprintf("match: crypto/rand failed: %v", err))
@@ -561,7 +568,8 @@ func newToken() string {
 	return hex.EncodeToString(b[:])
 }
 
-func hashToken(t string) string {
+// HashToken is what a match stores (and compares) instead of a token.
+func HashToken(t string) string {
 	sum := sha256.Sum256([]byte(t))
 	return hex.EncodeToString(sum[:])
 }

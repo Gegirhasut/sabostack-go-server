@@ -23,6 +23,7 @@ type mmEnv struct {
 	mu  sync.Mutex
 	// matches created, by hosting node
 	created map[string][][2]string
+	hashes  []string // token hashes the hosts were given
 }
 
 func newEnv(t *testing.T) *mmEnv {
@@ -36,12 +37,12 @@ func newEnv(t *testing.T) *mmEnv {
 func (e *mmEnv) node(t *testing.T, name string) *Matchmaker {
 	t.Helper()
 	e.mr.Set("t:alive:"+name, "ws://"+name) // alive (no TTL in this test)
-	create := func(names [2]string) (string, [2]string, error) {
+	create := func(names, tokenHashes [2]string) (string, error) {
 		e.mu.Lock()
 		defer e.mu.Unlock()
 		e.created[name] = append(e.created[name], names)
-		id := fmt.Sprintf("%s-m%d", name, len(e.created[name]))
-		return id, [2]string{id + "-t0", id + "-t1"}, nil
+		e.hashes = append(e.hashes, tokenHashes[0], tokenHashes[1])
+		return fmt.Sprintf("%s-m%d", name, len(e.created[name])), nil
 	}
 	m, err := NewMatchmaker(e.rdb, "t:", name, "ws://"+name, create, metrics.New(prometheus.NewRegistry()), slog.New(slog.NewTextHandler(io.Discard, nil)))
 	if err != nil {
@@ -91,7 +92,7 @@ func TestCrossNodePairing(t *testing.T) {
 	if local.URL != "" || remote.URL != "ws://"+host {
 		t.Fatalf("host %s: local url %q, remote url %q", host, local.URL, remote.URL)
 	}
-	if n, _ := e.rdb.LLen(context.Background(), "t:mm:queue").Result(); n != 0 {
+	if n, _ := e.rdb.LLen(context.Background(), "t:mm:queue:v2").Result(); n != 0 {
 		t.Fatalf("queue length %d after pairing", n)
 	}
 }
@@ -99,7 +100,7 @@ func TestCrossNodePairing(t *testing.T) {
 // Tickets of nodes whose heartbeat expired are skipped, not paired.
 func TestDeadNodeTicketsAreSkipped(t *testing.T) {
 	e := newEnv(t)
-	e.rdb.RPush(context.Background(), "t:mm:queue", "ghost-ticket\tghost\tcasper")
+	e.rdb.RPush(context.Background(), "t:mm:queue:v2", "ghost-ticket\tghost\thash\tcasper")
 	n1 := e.node(t, "n1")
 	a := n1.JoinContext(context.Background(), "a")
 	b := n1.JoinContext(context.Background(), "b")
@@ -116,7 +117,7 @@ func TestLeaveRemovesQueuedTicket(t *testing.T) {
 	if !n1.Leave(tk) {
 		t.Fatal("leave of a queued ticket failed")
 	}
-	if n, _ := e.rdb.LLen(context.Background(), "t:mm:queue").Result(); n != 0 {
+	if n, _ := e.rdb.LLen(context.Background(), "t:mm:queue:v2").Result(); n != 0 {
 		t.Fatalf("queue length %d after leave", n)
 	}
 	if n1.Leave(tk) {
@@ -134,12 +135,12 @@ func TestLostAssignmentIsRequeued(t *testing.T) {
 	e := newEnv(t)
 	n1 := e.node(t, "n1")
 	tk := n1.JoinContext(context.Background(), "alice")
-	if _, err := e.rdb.LPop(context.Background(), "t:mm:queue").Result(); err != nil { // a popper that crashed
+	if _, err := e.rdb.LPop(context.Background(), "t:mm:queue:v2").Result(); err != nil { // a popper that crashed
 		t.Fatal(err)
 	}
 	deadline := time.Now().Add(5 * time.Second)
 	for {
-		if n, _ := e.rdb.LLen(context.Background(), "t:mm:queue").Result(); n == 1 {
+		if n, _ := e.rdb.LLen(context.Background(), "t:mm:queue:v2").Result(); n == 1 {
 			break
 		}
 		if time.Now().After(deadline) {
@@ -162,7 +163,7 @@ func TestCloseRemovesLocalTickets(t *testing.T) {
 	if a := wait(t, tk); a.Err == nil {
 		t.Fatalf("assignment after close: %+v", a)
 	}
-	if n, _ := e.rdb.LLen(context.Background(), "t:mm:queue").Result(); n != 0 {
+	if n, _ := e.rdb.LLen(context.Background(), "t:mm:queue:v2").Result(); n != 0 {
 		t.Fatalf("queue length %d after close", n)
 	}
 	if a := wait(t, n1.JoinContext(context.Background(), "late")); a.Err == nil {
