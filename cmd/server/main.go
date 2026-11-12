@@ -19,6 +19,7 @@ import (
 	"github.com/redis/go-redis/v9"
 
 	"github.com/Gegirhasut/sabostack-go-server/internal/clock"
+	"github.com/Gegirhasut/sabostack-go-server/internal/cluster"
 	"github.com/Gegirhasut/sabostack-go-server/internal/match"
 	"github.com/Gegirhasut/sabostack-go-server/internal/metrics"
 	"github.com/Gegirhasut/sabostack-go-server/internal/server"
@@ -34,12 +35,14 @@ type config struct {
 	logJSON, publicMetrics bool
 	drainTimeout           time.Duration
 	origins                string
+	sharedQueue            bool
+	cluster                cluster.Options
 	opts                   match.Options
 	srv                    server.Config
 }
 
 func main() {
-	c := config{opts: match.DefaultOptions(), srv: server.DefaultConfig()}
+	c := config{opts: match.DefaultOptions(), srv: server.DefaultConfig(), cluster: cluster.DefaultOptions()}
 	flag.StringVar(&c.addr, "addr", envOr("ADDR", ":8080"), "public listen address (WebSocket and health checks)")
 	flag.StringVar(&c.adminAddr, "admin-addr", os.Getenv("ADMIN_ADDR"), "private listen address for /metrics and /debug/pprof (empty = metrics on the public address, no pprof)")
 	flag.BoolVar(&c.publicMetrics, "public-metrics", envBool("PUBLIC_METRICS", true), "with -admin-addr: also keep /metrics on the public address")
@@ -48,6 +51,8 @@ func main() {
 	flag.DurationVar(&c.redisTTL, "redis-ttl", time.Hour, "how long an orphaned snapshot is kept")
 	flag.StringVar(&c.nodeID, "node-id", os.Getenv("NODE_ID"), "stable node id; required when several servers share one Redis (each restores only its own matches)")
 	flag.StringVar(&c.publicURL, "public-url", os.Getenv("PUBLIC_URL"), "this node's public WebSocket URL; other nodes send resuming clients here")
+	flag.DurationVar(&c.cluster.Lease, "lease", c.cluster.Lease, "with -node-id: a node silent this long is dead and its matches move to other nodes")
+	flag.BoolVar(&c.sharedQueue, "shared-queue", envBool("SHARED_QUEUE", true), "with -node-id: one matchmaking queue for all nodes (false: per-node queue)")
 	flag.StringVar(&c.logLevel, "log-level", "info", "debug, info, warn or error")
 	flag.BoolVar(&c.logJSON, "log-json", true, "log as JSON (false = human-readable text)")
 	flag.DurationVar(&c.drainTimeout, "drain-timeout", envDuration("DRAIN_TIMEOUT", 0), "on SIGTERM, stop matchmaking and let running matches finish for up to this long before snapshotting the rest (0 = snapshot immediately)")
@@ -95,9 +100,13 @@ func run(log *slog.Logger, c config) error {
 	reg.MustRegister(collectors.NewGoCollector(), collectors.NewProcessCollector(collectors.ProcessCollectorOpts{}))
 	met := metrics.New(reg)
 
-	var st store.Store = store.NewMemory()
+	var (
+		st  store.Store = store.NewMemory()
+		rdb *redis.Client
+		rs  *store.Redis
+	)
 	if c.redisAddr != "" {
-		rdb := redis.NewClient(&redis.Options{Addr: c.redisAddr})
+		rdb = redis.NewClient(&redis.Options{Addr: c.redisAddr})
 		defer rdb.Close()
 		pingCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
 		err := rdb.Ping(pingCtx).Err()
@@ -105,7 +114,7 @@ func run(log *slog.Logger, c config) error {
 		if err != nil {
 			return err
 		}
-		rs := store.NewRedis(rdb, c.prefix, c.redisTTL)
+		rs = store.NewRedis(rdb, c.prefix, c.redisTTL)
 		if c.nodeID != "" {
 			rs = rs.ForNode(c.nodeID, c.publicURL)
 			log.Info("using redis snapshot store", "addr", c.redisAddr, "node", c.nodeID)
@@ -121,13 +130,41 @@ func run(log *slog.Logger, c config) error {
 	}
 
 	mgr := match.NewManager(c.opts, clock.Real{}, st, met, log)
+
+	// Cluster mode: announce this node before restoring, so nobody adopts its matches
+	// while it restarts; then adopt dead nodes' matches in the background.
+	var (
+		node       *cluster.Node
+		srv        *server.Server
+		nodeCancel = func() {}
+	)
+	if c.nodeID != "" && rs != nil {
+		node = cluster.NewNode(rs, mgr, met, log, c.cluster, func() bool { return srv != nil && !srv.Draining() })
+		if err := node.Join(ctx); err != nil {
+			return err
+		}
+	}
 	n, err := mgr.Restore(ctx)
 	if err != nil {
 		return err
 	}
 	log.Info("restored matches", "count", n)
 
-	srv := server.NewWithConfig(mgr, met, reg, log, c.srv)
+	srv = server.NewWithConfig(mgr, met, reg, log, c.srv)
+	if node != nil {
+		if c.sharedQueue {
+			mm, err := cluster.NewMatchmaker(rdb, c.prefix, c.nodeID, c.publicURL, mgr.Create, met, log)
+			if err != nil {
+				return err
+			}
+			srv.UseMatchmaker(mm)
+		}
+		var nodeCtx context.Context
+		nodeCtx, nodeCancel = context.WithCancel(context.Background())
+		go node.Run(nodeCtx)
+		log.Info("cluster mode", "node", c.nodeID, "url", c.publicURL, "lease", c.cluster.Lease, "sharedQueue", c.sharedQueue)
+	}
+	defer nodeCancel()
 	httpSrv := &http.Server{Addr: c.addr, Handler: srv.Handler(), ReadHeaderTimeout: 5 * time.Second, MaxHeaderBytes: 16 << 10}
 	errc := make(chan error, 2)
 	go func() { errc <- httpSrv.ListenAndServe() }()
@@ -166,6 +203,13 @@ func run(log *slog.Logger, c config) error {
 	}
 	if err := srv.Shutdown(shutdownCtx); err != nil {
 		return err
+	}
+	if node != nil {
+		// Final snapshots are written: hand the matches over now instead of after a lease.
+		nodeCancel()
+		if err := node.Leave(shutdownCtx); err != nil {
+			log.Warn("cluster leave", "err", err)
+		}
 	}
 	if adminSrv != nil {
 		_ = adminSrv.Shutdown(shutdownCtx)

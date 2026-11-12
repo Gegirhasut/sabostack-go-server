@@ -18,6 +18,7 @@ type Assignment struct {
 	Seat     int
 	Token    string
 	Opponent string
+	URL      string // the server running the match; empty means this one
 	Err      error
 }
 
@@ -34,6 +35,26 @@ type Ticket struct {
 
 // C delivers the assignment (or an error).
 func (t *Ticket) C() <-chan Assignment { return t.c }
+
+// NewTicket creates a ticket for a player whose connection is tied to ctx. Queue makes
+// its own; other matchmakers (the cluster one) use this.
+func NewTicket(ctx context.Context, name string) *Ticket {
+	return &Ticket{Name: name, c: make(chan Assignment, 1), ctx: ctx}
+}
+
+// Deliver hands the ticket its assignment. Only the first delivery counts; it reports
+// whether this one did.
+func (t *Ticket) Deliver(a Assignment) bool {
+	select {
+	case t.c <- a:
+		return true
+	default:
+		return false
+	}
+}
+
+// Gone reports whether the player's connection is closed.
+func (t *Ticket) Gone() bool { return t.gone() }
 
 func (t *Ticket) gone() bool { return t.ctx.Err() != nil }
 
@@ -56,7 +77,7 @@ func (q *Queue) Join(name string) *Ticket { return q.JoinContext(context.Backgro
 // ctx is done is skipped instead of being paired, so nobody is matched with an opponent
 // who already left and then has to sit out the join timeout.
 func (q *Queue) JoinContext(ctx context.Context, name string) *Ticket {
-	t := &Ticket{Name: name, c: make(chan Assignment, 1), ctx: ctx}
+	t := NewTicket(ctx, name)
 	q.mu.Lock()
 	if q.closed {
 		q.mu.Unlock()

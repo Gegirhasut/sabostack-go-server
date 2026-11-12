@@ -69,10 +69,26 @@ func DefaultConfig() Config {
 	}
 }
 
+// Matchmaker pairs queued players. *lobby.Queue does it inside one process;
+// cluster.Matchmaker does it across all nodes sharing a Redis.
+type Matchmaker interface {
+	JoinContext(ctx context.Context, name string) *lobby.Ticket
+	Leave(t *lobby.Ticket) bool
+	Close()
+}
+
+// errRedirected ends a session whose match runs on another server: the client was told
+// where (matched.url) and reconnects there.
+var errRedirected = errors.New("match runs on another server")
+
+// assignWait bounds how long a player who left the queue waits for an assignment that
+// was already on its way (a lost one must not leak the connection handler).
+const assignWait = 5 * time.Second
+
 // Server wires the matchmaking queue and match manager to WebSocket clients.
 type Server struct {
 	mgr      *match.Manager
-	queue    *lobby.Queue
+	queue    Matchmaker
 	metrics  *metrics.Metrics
 	gatherer prometheus.Gatherer
 	log      *slog.Logger
@@ -201,6 +217,12 @@ func (s *Server) Drain() {
 	}
 	s.queue.Close()
 }
+
+// Draining reports whether Drain was called.
+func (s *Server) Draining() bool { return s.draining.Load() }
+
+// UseMatchmaker replaces the in-process queue (call before serving).
+func (s *Server) UseMatchmaker(mm Matchmaker) { s.queue = mm }
 
 // Shutdown stops matchmaking, snapshots and stops all matches (which closes their
 // sockets), then waits for connection handlers to exit. Call it after http.Server.Shutdown
@@ -377,7 +399,11 @@ func (s *Server) joinQueue(c *client, in <-chan protocol.ClientMsg, hello protoc
 			if s.queue.Leave(ticket) {
 				return nil, 0, errors.New("left queue")
 			}
-			a = <-ticket.C() // matched concurrently with the disconnect
+			select { // matched concurrently with the disconnect
+			case a = <-ticket.C():
+			case <-time.After(assignWait):
+				return nil, 0, errors.New("left queue; assignment never arrived")
+			}
 			waiting = false
 		}
 	}
@@ -385,7 +411,12 @@ func (s *Server) joinQueue(c *client, in <-chan protocol.ClientMsg, hello protoc
 		c.Send(errMsg("unavailable", a.Err.Error()))
 		return nil, 0, a.Err
 	}
-	c.Send(protocol.Matched{Type: protocol.TypeMatched, MatchID: a.MatchID, Seat: a.Seat, Token: a.Token, Opponent: a.Opponent})
+	c.Send(protocol.Matched{Type: protocol.TypeMatched, MatchID: a.MatchID, Seat: a.Seat, Token: a.Token, Opponent: a.Opponent, URL: a.URL})
+	if a.URL != "" {
+		s.metrics.Matchmaking.WithLabelValues("redirected").Inc()
+		c.Close("match on another server")
+		return nil, 0, errRedirected
+	}
 	return s.resume(c, a.MatchID, a.Token, 0)
 }
 

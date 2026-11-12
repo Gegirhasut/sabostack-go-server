@@ -43,7 +43,10 @@ type config struct {
 	StormAt    time.Duration `json:"stormAt"`  // 0 = no reconnect storm
 	StormFrac  float64       `json:"stormFraction"`
 	Proto      string        `json:"proto"` // "json" or "bin"
-	Label      string        `json:"label"`
+	// ResumeOnDrop: a socket dropped mid-match is resumed (on any server) instead of
+	// counting as a dropped connection.
+	ResumeOnDrop bool   `json:"resumeOnDrop"`
+	Label        string `json:"label"`
 }
 
 var actions = []game.Action{game.Left, game.Right, game.Rotate, game.SoftDrop, game.HardDrop}
@@ -55,6 +58,8 @@ type stats struct {
 	matches, errors, dropped  atomic.Int64
 	msgs, bytes, inputs       atomic.Int64
 	bytesSent                 atomic.Int64
+	redirects                 atomic.Int64 // matched.url or wrong_server followed
+	dropsRecovered, dropsLost atomic.Int64
 	violations, printed       atomic.Int64 // protocol/game invariant violations (check.go)
 	stormTried, stormOK       atomic.Int64
 	stormFailed, stormSkipped atomic.Int64
@@ -62,6 +67,23 @@ type stats struct {
 	mu    sync.Mutex
 	ack   []time.Duration // input sent -> first state acknowledging it
 	recon []time.Duration // socket dropped -> resume snapshot received
+	dropR []time.Duration // unexpected drop -> resumed (possibly on another server)
+}
+
+// reconnected records a finished reconnect of the given kind ("" = none pending).
+func (s *stats) reconnected(kind string, d time.Duration) {
+	switch kind {
+	case "storm":
+		s.mu.Lock()
+		s.recon = append(s.recon, d)
+		s.mu.Unlock()
+		s.stormOK.Add(1)
+	case "drop":
+		s.mu.Lock()
+		s.dropR = append(s.dropR, d)
+		s.mu.Unlock()
+		s.dropsRecovered.Add(1)
+	}
 }
 
 func (s *stats) addAck(d time.Duration) {
@@ -75,8 +97,9 @@ func (s *stats) addAck(d time.Duration) {
 
 func main() {
 	var c config
-	flag.StringVar(&c.URL, "url", "ws://localhost:8080/ws", "server WebSocket URL")
-	flag.StringVar(&c.MetricsURL, "metrics", "http://localhost:8080/metrics", "server metrics URL (empty to skip)")
+	flag.StringVar(&c.URL, "url", "ws://localhost:8080/ws", "server WebSocket URL; a comma-separated list spreads the bots over several servers")
+	flag.StringVar(&c.MetricsURL, "metrics", "http://localhost:8080/metrics", "server metrics URL, or a comma-separated list summed over all servers (empty to skip)")
+	flag.BoolVar(&c.ResumeOnDrop, "resume-on-drop", false, "resume a match after an unexpected disconnect (through any server) instead of giving it up")
 	flag.IntVar(&c.Pairs, "pairs", 50, "number of bot pairs")
 	flag.Float64Var(&c.Rate, "rate", 10, "inputs per second per bot")
 	flag.DurationVar(&c.Ramp, "ramp", 2*time.Millisecond, "delay between starting bots")
@@ -110,6 +133,12 @@ func run(c config) *result {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
+	var urls []string
+	for _, u := range strings.Split(c.URL, ",") {
+		if u = strings.TrimSpace(u); u != "" {
+			urls = append(urls, u)
+		}
+	}
 	storms := make([]chan struct{}, bots)
 	stormEvery := 0
 	if c.StormAt > 0 && c.StormFrac > 0 {
@@ -132,7 +161,7 @@ func run(c config) *result {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			b := &bot{cfg: c, name: fmt.Sprintf("bot%d", i), st: st, storm: storm}
+			b := &bot{cfg: c, name: fmt.Sprintf("bot%d", i), st: st, storm: storm, urls: urls, entry: urls[i%len(urls)]}
 			b.loop(ctx)
 		}()
 		time.Sleep(c.Ramp)
@@ -177,6 +206,8 @@ func run(c config) *result {
 
 type bot struct {
 	cfg   config
+	urls  []string // every server, for drop recovery
+	entry string   // the server this bot joins through (its "load balancer" pick)
 	name  string
 	st    *stats
 	storm <-chan struct{} // closed when this bot should drop its socket and resume
@@ -281,7 +312,16 @@ type serverMsg struct {
 	MatchID string         `json:"matchId"`
 	Token   string         `json:"token"`
 	Event   protocol.Event `json:"event"`
+	Code    string         `json:"code"` // error
+	URL     string         `json:"url"`  // matched (match elsewhere), error wrong_server
 	State   protocol.State `json:"state"`
+	// state (decoded in the same pass: a real client needs the boards to draw them)
+	Tick        uint64                `json:"tick"`
+	Round       int                   `json:"round"`
+	Paused      bool                  `json:"paused"`
+	RemainingMs int64                 `json:"remainingMs"`
+	EventSeq    uint64                `json:"eventSeq"`
+	Players     []protocol.PlayerView `json:"players"`
 	// snapshot
 	Events         []protocol.Event `json:"events"`
 	EventsComplete bool             `json:"eventsComplete"`
@@ -289,10 +329,23 @@ type serverMsg struct {
 
 // playMatch runs one match. A single goroutine owns all bot state; a reader goroutine per
 // socket only forwards raw frames.
+//
+// The bot moves between servers like a real client: it follows matched.url and
+// wrong_server redirects, and with -resume-on-drop it treats a dropped socket in the
+// middle of a match (its server died, say) as a reason to reconnect through its entry
+// server and resume, not as a lost match.
 func (b *bot) playMatch(ctx context.Context, every time.Duration) error {
 	bin := b.cfg.Proto == "bin"
 	chk := &checker{bot: b.name, violations: &b.st.violations, printed: &b.st.printed}
-	c, err := dial(ctx, b.cfg.URL, bin)
+	// Join through the entry server; if it is down, through the next one, as a load
+	// balancer would.
+	var c *conn
+	var err error
+	for i, start := 0, slices.Index(b.urls, b.entry); i < len(b.urls); i++ {
+		if c, err = dial(ctx, b.urls[(start+i)%len(b.urls)], bin); err == nil {
+			break
+		}
+	}
 	if err != nil {
 		return err
 	}
@@ -308,16 +361,52 @@ func (b *bot) playMatch(ctx context.Context, every time.Duration) error {
 		seq            uint64
 		sent           = map[uint64]time.Time{}
 		storm          = b.storm
-		droppedAt      time.Time      // non-zero while waiting for the resume snapshot
 		state          protocol.State // binary mode: base for the next delta
 		haveState      bool
 		inBuf          []byte
+		// A reconnect in progress: why, since when, and the deadline for drop recovery.
+		pending   string // "", "storm", "redirect", "drop"
+		pendingAt time.Time
+		nextURL   = 0
 	)
 	ack := func(upto uint64, now time.Time) {
 		for s, at := range sent {
 			if s <= upto {
 				b.st.addAck(now.Sub(at))
 				delete(sent, s)
+			}
+		}
+	}
+	// reattach moves to url (a new socket) and resumes the match there.
+	reattach := func(url, why string) error {
+		c.close()
+		haveState, playing = false, false // the new connection starts from its snapshot
+		if pending == "" || why != "drop" {
+			pending, pendingAt = why, time.Now()
+		}
+		nc, err := dial(ctx, url, bin)
+		if err != nil {
+			return err
+		}
+		c = nc
+		return c.ws.WriteJSON(protocol.ClientMsg{Type: protocol.TypeResume, MatchID: matchID, Token: token, LastEventSeq: lastEvent})
+	}
+	// recoverDrop retries a resume on the servers in turn until one answers or 30 s pass.
+	recoverDrop := func() error {
+		for {
+			if time.Since(pendingAt) > dropRecoveryWindow {
+				b.st.dropsLost.Add(1)
+				return errDropped
+			}
+			url := b.urls[nextURL%len(b.urls)]
+			nextURL++
+			if err := reattach(url, "drop"); err == nil {
+				return nil
+			}
+			select {
+			case <-ctx.Done():
+				return nil
+			case <-time.After(250 * time.Millisecond):
 			}
 		}
 	}
@@ -333,7 +422,16 @@ func (b *bot) playMatch(ctx context.Context, every time.Duration) error {
 
 		case fr, ok := <-c.in:
 			if !ok {
-				return errDropped
+				if matchID == "" || !b.cfg.ResumeOnDrop {
+					return errDropped
+				}
+				if pending == "" {
+					pending, pendingAt = "drop", time.Now()
+				}
+				if err := recoverDrop(); err != nil {
+					return err
+				}
+				continue
 			}
 			raw := fr.b
 			now := time.Now()
@@ -366,39 +464,60 @@ func (b *bot) playMatch(ctx context.Context, every time.Duration) error {
 			switch m.Type {
 			case protocol.TypeMatched:
 				matchID, token = m.MatchID, m.Token
-			case protocol.TypeState:
-				var st protocol.State
-				if json.Unmarshal(raw, &st) == nil {
-					chk.state(st)
+				if m.URL != "" { // the match runs on another server
+					b.st.redirects.Add(1)
+					if err := reattach(m.URL, "redirect"); err != nil {
+						return err
+					}
 				}
-				playing = m.Phase == "playing" && !st.Paused
+			case protocol.TypeState:
+				chk.state(protocol.State{
+					Type: m.Type, Tick: m.Tick, Phase: m.Phase, Round: m.Round, Paused: m.Paused,
+					RemainingMs: m.RemainingMs, Ack: m.Ack, EventSeq: m.EventSeq, Players: m.Players,
+				})
+				playing = m.Phase == "playing" && !m.Paused
 				ack(m.Ack, now)
 			case protocol.TypeSnapshot:
 				chk.snapshot(protocol.Snapshot{State: m.State, Events: m.Events, EventsComplete: m.EventsComplete})
 				state, haveState = m.State, true
 				playing = m.State.Phase == "playing"
 				ack(m.State.Ack, now)
-				if !droppedAt.IsZero() {
-					b.st.mu.Lock()
-					b.st.recon = append(b.st.recon, now.Sub(droppedAt))
-					b.st.mu.Unlock()
-					b.st.stormOK.Add(1)
-					droppedAt = time.Time{}
-				}
+				b.st.reconnected(pending, now.Sub(pendingAt))
+				pending = ""
 			case protocol.TypeEvent:
 				chk.event(m.Event)
 				lastEvent = m.Event.Seq
 				if m.Event.Kind == protocol.EvMatchOver {
+					chk.end(true)
 					if b.st.measuring.Load() {
 						b.st.matches.Add(1)
 					}
 					return nil
 				}
 			case protocol.TypeError:
-				if !droppedAt.IsZero() {
-					b.st.stormFailed.Add(1)
+				switch {
+				case m.Code == "wrong_server" && m.URL != "":
+					b.st.redirects.Add(1)
+					if err := reattach(m.URL, pendingOr(pending, "redirect")); err != nil && pending != "drop" {
+						return err
+					}
+				case pending == "drop" && (m.Code == "match_not_found" || m.Code == "unavailable"):
+					// The match is between nodes (its server died, no one adopted it yet):
+					// keep trying until the recovery window closes.
+					select {
+					case <-ctx.Done():
+						return nil
+					case <-time.After(500 * time.Millisecond):
+					}
+					if err := recoverDrop(); err != nil {
+						return err
+					}
+				default:
+					if pending == "storm" {
+						b.st.stormFailed.Add(1)
+					}
+					return fmt.Errorf("server error: %s", raw)
 				}
-				return fmt.Errorf("server error: %s", raw)
 			}
 
 		case <-storm:
@@ -408,25 +527,17 @@ func (b *bot) playMatch(ctx context.Context, every time.Duration) error {
 				continue
 			}
 			b.st.stormTried.Add(1)
-			droppedAt = time.Now()
-			c.close()
-			haveState = false // the new connection starts from its snapshot
-			nc, err := dial(ctx, b.cfg.URL, bin)
-			if err != nil {
+			if err := reattach(b.entry, "storm"); err != nil {
 				b.st.stormFailed.Add(1)
 				return err
 			}
-			c = nc
-			if err := c.ws.WriteJSON(protocol.ClientMsg{Type: protocol.TypeResume, MatchID: matchID, Token: token, LastEventSeq: lastEvent}); err != nil {
-				b.st.stormFailed.Add(1)
-				return err
-			}
-			playing = false
 
 		case <-tick.C:
 			tick.Reset(every)
-			if !droppedAt.IsZero() && time.Since(droppedAt) > 10*time.Second {
-				b.st.stormFailed.Add(1)
+			if pending != "" && pending != "drop" && time.Since(pendingAt) > 10*time.Second {
+				if pending == "storm" {
+					b.st.stormFailed.Add(1)
+				}
 				return errors.New("resume timed out")
 			}
 			if !playing {
@@ -441,7 +552,7 @@ func (b *bot) playMatch(ctx context.Context, every time.Duration) error {
 			}
 			var n int
 			if inBuf, n, err = c.sendInput(seq, a, inBuf); err != nil {
-				return errDropped
+				continue // the reader sees the broken socket and recovers or gives up
 			}
 			if b.st.measuring.Load() {
 				b.st.inputs.Add(1)
@@ -450,6 +561,16 @@ func (b *bot) playMatch(ctx context.Context, every time.Duration) error {
 		}
 	}
 }
+
+func pendingOr(p, def string) string {
+	if p != "" {
+		return p
+	}
+	return def
+}
+
+// dropRecoveryWindow is how long a bot keeps trying to resume after its server vanished.
+const dropRecoveryWindow = 30 * time.Second
 
 // ---------------------------------------------------------------------------- metrics
 
@@ -496,14 +617,28 @@ func startSampler(ctx context.Context, url string, st *stats) *sampler {
 	return s
 }
 
+// scrapeNow takes one sample. With several metrics URLs (one per server) the values are
+// summed over the servers (the tick maximum is the largest); a server that does not answer
+// is left out of that sample.
 func (s *sampler) scrapeNow() {
+	smp := sample{T: time.Since(s.start).Seconds(), MsgsReceived: s.st.msgs.Load()}
+	for _, u := range strings.Split(s.url, ",") {
+		if u = strings.TrimSpace(u); u != "" {
+			scrapeInto(u, &smp)
+		}
+	}
+	s.mu.Lock()
+	s.samples = append(s.samples, smp)
+	s.mu.Unlock()
+}
+
+func scrapeInto(url string, smp *sample) {
 	cl := http.Client{Timeout: 3 * time.Second}
-	resp, err := cl.Get(s.url)
+	resp, err := cl.Get(url)
 	if err != nil {
 		return
 	}
 	defer resp.Body.Close()
-	smp := sample{T: time.Since(s.start).Seconds(), MsgsReceived: s.st.msgs.Load()}
 	sc := bufio.NewScanner(resp.Body)
 	for sc.Scan() {
 		f := strings.Fields(sc.Text())
@@ -521,28 +656,25 @@ func (s *sampler) scrapeNow() {
 		}
 		switch f[0] {
 		case "process_cpu_seconds_total":
-			smp.CPUSeconds = v
+			smp.CPUSeconds += v
 		case "process_resident_memory_bytes":
-			smp.RSSBytes = v
+			smp.RSSBytes += v
 		case "go_goroutines":
-			smp.Goroutines = v
+			smp.Goroutines += v
 		case "sabostack_active_matches":
-			smp.ActiveMatches = v
+			smp.ActiveMatches += v
 		case "sabostack_live_matches":
-			smp.LiveMatches = v
+			smp.LiveMatches += v
 		case "sabostack_connected_players":
-			smp.Connections = v
+			smp.Connections += v
 		case "sabostack_tick_duration_seconds_sum":
-			smp.TickSum = v
+			smp.TickSum += v
 		case "sabostack_tick_duration_seconds_count":
-			smp.TickCount = v
+			smp.TickCount += v
 		case "sabostack_tick_duration_max_seconds":
-			smp.TickMax = v
+			smp.TickMax = max(smp.TickMax, v)
 		}
 	}
-	s.mu.Lock()
-	s.samples = append(s.samples, smp)
-	s.mu.Unlock()
 }
 
 // ---------------------------------------------------------------------------- results
@@ -556,6 +688,12 @@ type result struct {
 	MatchesFinished int64   `json:"matchesFinished"` // match_over seen by bots, /2
 	Errors          int64   `json:"errors"`
 	Violations      int64   `json:"violations"` // protocol/game invariant violations seen by bots
+	Redirects       int64   `json:"redirects"`
+	DropsRecovered  int64   `json:"dropsRecovered"`
+	DropsLost       int64   `json:"dropsLost"`
+	DropRecP50Ms    float64 `json:"dropRecoveryP50Ms"`
+	DropRecP95Ms    float64 `json:"dropRecoveryP95Ms"`
+	DropRecMaxMs    float64 `json:"dropRecoveryMaxMs"`
 	Dropped         int64   `json:"droppedConnections"`
 	InputsSent      int64   `json:"inputsSent"`
 	MsgsReceived    int64   `json:"msgsReceived"`
@@ -622,6 +760,7 @@ func summarize(c config, st *stats, smp *sampler, start, rampDone, mStart, mEnd 
 	r.MatchesFinished = st.matches.Load() / 2
 	r.Errors, r.Dropped = st.errors.Load(), st.dropped.Load()
 	r.Violations = st.violations.Load()
+	r.Redirects, r.DropsRecovered, r.DropsLost = st.redirects.Load(), st.dropsRecovered.Load(), st.dropsLost.Load()
 	r.InputsSent, r.MsgsReceived = st.inputs.Load(), st.msgs.Load()
 	r.MsgsPerSecond = float64(r.MsgsReceived) / r.MeasureSeconds
 	r.MBReceived = float64(st.bytes.Load()) / 1e6
@@ -631,6 +770,10 @@ func summarize(c config, st *stats, smp *sampler, start, rampDone, mStart, mEnd 
 	slices.Sort(st.ack)
 	slices.Sort(st.recon)
 	lat, recon := st.ack, st.recon
+	slices.Sort(st.dropR)
+	if dr := st.dropR; len(dr) > 0 {
+		r.DropRecP50Ms, r.DropRecP95Ms, r.DropRecMaxMs = ms(pct(dr, 50)), ms(pct(dr, 95)), ms(dr[len(dr)-1])
+	}
 	st.mu.Unlock()
 	r.AckSamples = len(lat)
 	if len(lat) > 0 {
@@ -705,6 +848,10 @@ func (r *result) print() {
 	fmt.Printf("matches finished:   %d\n", r.MatchesFinished)
 	fmt.Printf("errors / dropped:   %d / %d\n", r.Errors, r.Dropped)
 	fmt.Printf("violations:         %d\n", r.Violations)
+	if r.Redirects+r.DropsRecovered+r.DropsLost > 0 {
+		fmt.Printf("cross-server:       %d redirects; drops resumed %d, lost %d; drop->resumed p50=%.0fms p95=%.0fms max=%.0fms\n",
+			r.Redirects, r.DropsRecovered, r.DropsLost, r.DropRecP50Ms, r.DropRecP95Ms, r.DropRecMaxMs)
+	}
 	fmt.Printf("inputs sent:        %d\n", r.InputsSent)
 	fmt.Printf("messages received:  %d (%.0f/s, %.1f MB); inputs sent: %.1f MB (%s)\n", r.MsgsReceived, r.MsgsPerSecond, r.MBReceived, r.MBSent, r.Config.Proto)
 	fmt.Printf("input->ack latency: p50=%.1fms p95=%.1fms p99=%.1fms max=%.1fms (n=%d)\n", r.AckP50Ms, r.AckP95Ms, r.AckP99Ms, r.AckMaxMs, r.AckSamples)

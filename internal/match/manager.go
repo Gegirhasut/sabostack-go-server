@@ -152,8 +152,9 @@ func (m *Manager) LiveCount() int { return int(m.live.Load()) }
 // Store returns the snapshot store.
 func (m *Manager) Store() store.Store { return m.store }
 
-// Restore loads every snapshot from the store and resumes those matches. It is called
-// once at startup, before the server accepts connections.
+// Restore loads every snapshot from the store and resumes those matches that are not
+// running. It is called at startup, before the server accepts connections, and again by
+// a cluster node that got its lease back after stopping its matches.
 func (m *Manager) Restore(ctx context.Context) (int, error) {
 	snaps, err := m.store.LoadAll(ctx)
 	if err != nil {
@@ -161,6 +162,9 @@ func (m *Manager) Restore(ctx context.Context) (int, error) {
 	}
 	n := 0
 	for id, data := range snaps {
+		if _, running := m.Get(id); running {
+			continue // Restore again after a lost cluster lease: only what is missing
+		}
 		mt, err := Restore(data, m.opts.Match, m.clock.Now())
 		if err != nil || mt.Phase == MatchEnd {
 			m.log.Warn("discarding snapshot", "match", id, "err", err)
@@ -174,6 +178,47 @@ func (m *Manager) Restore(ctx context.Context) (int, error) {
 		m.log.Info("match restored", "match", id, "phase", mt.Phase.String(), "round", mt.Round)
 	}
 	return n, nil
+}
+
+// Adopt starts matches taken over from a dead node (see store.Cluster). It is Restore for
+// snapshots another process wrote: deadlines shift by the time since that node's last
+// snapshot, every seat starts disconnected and Countdown/Playing wait paused until the
+// players resume here.
+func (m *Manager) Adopt(snaps map[string][]byte) int {
+	n := 0
+	for id, data := range snaps {
+		if _, running := m.Get(id); running {
+			continue
+		}
+		mt, err := Restore(data, m.opts.Match, m.clock.Now())
+		if err != nil || mt.Phase == MatchEnd {
+			m.log.Warn("discarding adopted snapshot", "match", id, "err", err)
+			m.enqueue(id, nil, false)
+			continue
+		}
+		if !m.start(mt) {
+			return n
+		}
+		n++
+		m.metrics.MatchesAdopted.Inc()
+		m.log.Info("match adopted", "match", id, "phase", mt.Phase.String(), "round", mt.Round)
+	}
+	return n
+}
+
+// EvictAll stops every local match without persisting it: this node lost its cluster
+// lease and another node is about to adopt (or has adopted) its matches.
+func (m *Manager) EvictAll() int {
+	m.mu.Lock()
+	actors := make([]*Actor, 0, len(m.actors))
+	for _, a := range m.actors {
+		actors = append(actors, a)
+	}
+	m.mu.Unlock()
+	for _, a := range actors {
+		a.evict()
+	}
+	return len(actors)
 }
 
 // Shutdown snapshots and stops every match, then drains the persistence queues. All

@@ -58,6 +58,9 @@ type Matched struct {
 	Seat     int    `json:"seat"`
 	Token    string `json:"token"`
 	Opponent string `json:"opponent"`
+	// URL is set when the match runs on another server: the client connects there and
+	// sends resume with this matchId and token.
+	URL string `json:"url,omitempty"`
 }
 
 // Snapshot is sent on every (re)attach: the full current state plus the events the

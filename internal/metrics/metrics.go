@@ -24,6 +24,10 @@ type Metrics struct {
 	Kicked           *prometheus.CounterVec
 	WSBytes          *prometheus.CounterVec // payload bytes by dir (in/out) and format (json/binary)
 	WSFrames         *prometheus.CounterVec
+	MatchesAdopted   prometheus.Counter
+	ClusterFenced    prometheus.Gauge // 1 while this node could not renew its lease
+	ClusterErrors    *prometheus.CounterVec
+	Matchmaking      *prometheus.CounterVec
 
 	tickMaxNanos atomic.Int64
 }
@@ -93,11 +97,24 @@ func New(reg prometheus.Registerer) *Metrics {
 		WSFrames: prometheus.NewCounterVec(prometheus.CounterOpts{
 			Name: "sabostack_ws_frames_total", Help: "WebSocket messages, by direction (in/out) and format (json/binary).",
 		}, []string{"dir", "format"}),
+		MatchesAdopted: prometheus.NewCounter(prometheus.CounterOpts{
+			Name: "sabostack_matches_adopted_total", Help: "Matches taken over from dead nodes.",
+		}),
+		ClusterFenced: prometheus.NewGauge(prometheus.GaugeOpts{
+			Name: "sabostack_cluster_fenced", Help: "1 while this node cannot renew its lease (its matches were stopped).",
+		}),
+		ClusterErrors: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Name: "sabostack_cluster_errors_total", Help: "Failed cluster operations, by op.",
+		}, []string{"op"}),
+		Matchmaking: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Name: "sabostack_matchmaking_total", Help: "Matchmaking outcomes (local, remote, redirected, requeued, stale).",
+		}, []string{"result"}),
 	}
 	tickMax := prometheus.NewGaugeFunc(prometheus.GaugeOpts{
 		Name: "sabostack_tick_duration_max_seconds", Help: "Longest single tick processed since the process started.",
 	}, func() float64 { return time.Duration(m.tickMaxNanos.Load()).Seconds() })
 	reg.MustRegister(tickMax, m.ActiveMatches, m.LiveMatches, m.ConnectedPlayers, m.TickDuration, m.Inputs,
-		m.MatchesFinished, m.SnapshotWrites, m.SnapshotBytes, m.PersistPending, m.ActorPanics, m.ConnsRejected, m.Kicked, m.WSBytes, m.WSFrames)
+		m.MatchesFinished, m.SnapshotWrites, m.SnapshotBytes, m.PersistPending, m.ActorPanics, m.ConnsRejected, m.Kicked, m.WSBytes, m.WSFrames,
+		m.MatchesAdopted, m.ClusterFenced, m.ClusterErrors, m.Matchmaking)
 	return m
 }
