@@ -123,11 +123,11 @@ func TestReleaseHandsOverImmediately(t *testing.T) {
 	}
 }
 
-// Review 2026-11-12: during a graceful shutdown the node's players reconnected to other
+// Bug: during a graceful shutdown the node's players reconnected to other
 // nodes, which still saw the owner alive and redirected them straight back to a node whose
 // listener was already closed. A leaving node is still alive (nobody adopts its matches
 // while it writes their final snapshots) but is no redirect target: "match moving".
-func TestReviewLeavingNodeIsNotARedirectTarget(t *testing.T) {
+func TestLeavingNodeIsNotARedirectTarget(t *testing.T) {
 	ctx := context.Background()
 	_, n := clusterNodes(t, "a", "b")
 	if err := n["a"].Save(ctx, "m", []byte("x")); err != nil {
@@ -156,10 +156,10 @@ func TestReviewLeavingNodeIsNotARedirectTarget(t *testing.T) {
 	}
 }
 
-// Seventh review: a node took over matches whatever their snapshot format; during a
+// Bug: a node took over matches whatever their snapshot format; during a
 // rolling deploy that changes it, a node of one version would take matches it cannot run.
 // With an adopt filter it leaves them to a node that can.
-func TestReviewAdoptLeavesUnrunnableSnapshots(t *testing.T) {
+func TestAdoptLeavesUnrunnableSnapshots(t *testing.T) {
 	ctx := context.Background()
 	mr, n := clusterNodes(t, "dead", "old", "new")
 	for id, data := range map[string]string{"m-v1": "v1", "m-v2": "v2"} {
@@ -180,9 +180,9 @@ func TestReviewAdoptLeavesUnrunnableSnapshots(t *testing.T) {
 	}
 }
 
-// Seventh review: the adopt lock of a dead node was deleted unconditionally at the end of
+// Bug: the adopt lock of a dead node was deleted unconditionally at the end of
 // a scan, even if it had expired meanwhile and now belonged to another node.
-func TestReviewAdoptLockReleasedOnlyByItsHolder(t *testing.T) {
+func TestAdoptLockReleasedOnlyByItsHolder(t *testing.T) {
 	ctx := context.Background()
 	mr, n := clusterNodes(t, "b")
 	_ = mr.Set("c:adopt:dead", "other-node")
@@ -197,9 +197,9 @@ func TestReviewAdoptLockReleasedOnlyByItsHolder(t *testing.T) {
 	}
 }
 
-// Seventh review: node ids were not checked, but the owner value is "<node> <url>" and
+// Bug: node ids were not checked, but the owner value is "<node> <url>" and
 // tickets are tab-separated.
-func TestReviewNodeIDIsValidated(t *testing.T) {
+func TestNodeIDIsValidated(t *testing.T) {
 	for _, c := range []struct {
 		node, url string
 		ok        bool

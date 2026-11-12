@@ -1,6 +1,6 @@
 package server
 
-// Regression tests for the bugs found in the code review, at the protocol level. Each
+// Regression tests for the bugs found while hardening the server, at the protocol level. Each
 // one uses only APIs that existed before the fix (New, the test client from
 // integration_test.go), so it compiles against the old code and fails there.
 

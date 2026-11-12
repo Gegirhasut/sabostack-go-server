@@ -1,6 +1,6 @@
 package server
 
-// Regression tests for the external code review of 2026-11-12.
+// Regression tests for defects found after the first hardening pass.
 
 import (
 	"context"
@@ -18,7 +18,7 @@ import (
 
 // Bug: behind a proxy the client IP was the FIRST X-Forwarded-For entry, which the client
 // writes itself, so a random fake address per connection bypassed -max-conns-per-ip.
-func TestReviewForwardedForIsReadFromTheRight(t *testing.T) {
+func TestForwardedForIsReadFromTheRight(t *testing.T) {
 	cases := []struct {
 		proxies int
 		xff     []string
@@ -48,7 +48,7 @@ func TestReviewForwardedForIsReadFromTheRight(t *testing.T) {
 
 // Bug: a queued player's messages were all ignored, app-level ping included, so a client
 // measuring latency or checking the link got no pong until it was matched.
-func TestReviewPingIsAnsweredWhileQueued(t *testing.T) {
+func TestPingIsAnsweredWhileQueued(t *testing.T) {
 	ts := startServer(t, store.NewMemory())
 	c := dial(t, ts.url)
 	c.send(protocol.ClientMsg{Type: protocol.TypeJoin, Name: "solo"})
@@ -60,12 +60,12 @@ func TestReviewPingIsAnsweredWhileQueued(t *testing.T) {
 	}
 }
 
-// Second review: handleWS called conns.Add after the upgrade, so a connection upgrading
+// Bug: handleWS called conns.Add after the upgrade, so a connection upgrading
 // while Shutdown was already in conns.Wait added to a WaitGroup at zero concurrently with
 // Wait, which sync.WaitGroup forbids (the race detector reported it in TestOriginCheck
 // about once in six runs). Connections are now registered before the upgrade, under the
 // same lock Shutdown uses to close the door, and refused after it.
-func TestReviewShutdownDuringUpgrades(t *testing.T) {
+func TestShutdownDuringUpgrades(t *testing.T) {
 	for round := 0; round < 20; round++ {
 		ts := startServer(t, store.NewMemory())
 		stop := make(chan struct{})

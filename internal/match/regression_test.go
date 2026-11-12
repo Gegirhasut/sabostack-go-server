@@ -1,6 +1,6 @@
 package match
 
-// Regression tests for the bugs found in the code review. Each one reproduces the bug
+// Regression tests for the bugs found while hardening the server. Each one reproduces the bug
 // through APIs that existed before the fix, so it compiles against the old code and
 // fails there. docs/HARDENING.md lists the outcome of every test before and after.
 

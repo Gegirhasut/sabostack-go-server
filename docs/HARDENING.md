@@ -74,7 +74,7 @@ done
 | Медленного клиента отключали после 128 сообщений в очереди, хотя большинство из них — кадры `state`, которые всё равно устаревают. | Кадры `state` схлопываются: в очереди только последний неотправленный. События, снапшоты и ошибки не теряются никогда, и только 128 таких сообщений означают медленного клиента. |
 | `/metrics` на публичном порту, профилировщика нет. | `-admin-addr` отдаёт `/metrics`, `/healthz`, `/readyz` и `/debug/pprof/` на внутреннем адресе. `-public-metrics` (по умолчанию true) оставляет `/metrics` и на публичном порту, им пользуется бот. |
 | Нет readiness и плавного вывода узла при выкатке. | `/readyz` отвечает 503 во время draining. `-drain-timeout`: по SIGTERM узел перестаёт матчить (игроки в очереди получают `unavailable`), даёт идущим матчам доиграть, потом снимает снапшоты оставшихся. `resume` во время draining работает. Второй сигнал убивает процесс. |
-| Принимался любой Origin, лимитов подключений не было. | `-allowed-origins` (запрос без Origin, например из нативного приложения, принимается всегда), `-max-conns`, `-max-conns-per-ip`, `-trusted-proxies` (IP из `X-Forwarded-For`, читается справа: см. [REVIEW.md](REVIEW.md)). Лимиты по умолчанию выключены, чтобы локальные нагрузочные тесты с одного IP работали. |
+| Принимался любой Origin, лимитов подключений не было. | `-allowed-origins` (запрос без Origin, например из нативного приложения, принимается всегда), `-max-conns`, `-max-conns-per-ip`, `-trusted-proxies` (IP из `X-Forwarded-For`, читается справа: см. [ниже](#найдено-позже)). Лимиты по умолчанию выключены, чтобы локальные нагрузочные тесты с одного IP работали. |
 | Матчмейкинг мог свести игрока с соперником, чей сокет уже умер. | `lobby.JoinContext` пропускает заявки с завершённым контекстом подключения. `Leave` за O(1) (связный список). |
 | Причины отключений не было видно. | `sabostack_connections_kicked_total{reason}`: `slow_consumer`, `write_failed`, `ping_failed`, `pong_timeout`, `rate_limit`. Плюс `sabostack_connections_rejected_total{reason}` и `sabostack_persist_pending`. |
 
@@ -150,3 +150,25 @@ done
 
 - **Трафик** — бинарный протокол с дельтами, [WIRE.md](WIRE.md).
 - **Общий матчмейкинг и перехват матчей упавшего узла** — [CLUSTER.md](CLUSTER.md).
+
+## Найдено позже
+
+Дефекты, найденные после этого этапа: при перечитывании кода, на демо с отказом узла и
+при прогоне тестов на настоящем Redis вместо miniredis. На каждый есть тест в
+`internal/*/defects_test.go` (часть — в `internal/store/cluster_test.go`), который падает
+на коде до исправления.
+
+| Дефект | Исправление | Тест |
+|---|---|---|
+| IP брался из **первого** адреса `X-Forwarded-For`, который пишет сам клиент: подделкой обходился `-max-conns-per-ip`. | `-trusted-proxies N`: адрес N-й справа, его записал наш прокси. | `TestForwardedForIsReadFromTheRight` |
+| Переподключение давало лишнее время до idle-форфита, а новый сокет раз в 20 с позволял не проиграть вовсе. | `Attach` не трогает `LastInput`: время отсутствия уже учитывает пауза. | `TestReconnectAddsIdleCredit`, `TestReplacingConnectionResetsIdle` |
+| Узел останавливал свои матчи позже, чем истекала аренда, а медленный проход перехвата задерживал heartbeat здорового узла. | Heartbeat в своей горутине, отсчёт от отправки, остановка через 2/3 аренды. | `TestNodeFencesBeforeItsLeaseExpires`, `TestSlowAdoptionDoesNotDelayHeartbeats` |
+| Матч, запустившийся на уже изолированном узле, жил там зомби. | Изоляция и запуск перехваченных матчей взаимно исключены, пока узел изолирован, матчи повторно останавливаются. | `TestMatchStartedWhileFencedIsStopped` |
+| Неудачная запись снапшота повторялась только через 10 с. | Повтор на следующем тике снапшотов. | `TestFailedSnapshotIsRetried` |
+| При выкатке игроков отправляли на уходящий узел с уже закрытым портом. | Узел помечает себя уходящим, соседи отвечают `match_moving`. | `TestLeavingNodeIsNotARedirectTarget` |
+| Игрок узнавал о матче до того, как тот записан в Redis: `resume` на другом узле получал `match_not_found`. Нашлось только на настоящем Redis. | Матч объявляется после первой записи, которая идёт вне очереди периодических. | `TestMatchIsStoredBeforeItIsAnnounced`, `TestAwaitedWriteSkipsTheQueue`, `TestAwaitedWritesDoNotStarveRoutineOnes` |
+| Поздний pub/sub или медленный узел могли поставить игрока в два матча, а заявки ушедших игроков копились. | Claim на заявку и запись назначения в Redis до публикации; заявка ставится заново, только когда назначение точно не придёт. | `TestLostAssignmentMessageIsRecovered`, `TestLiveClaimerIsNotRequeuedDeadOneIs`, `TestGoneTicketAfterPopIsForgotten`, `TestTicketOfPlayerWhoLeftDuringJoinIsNotQueued` |
+| Сессионный токен игрока лежал в Redis открытым текстом. | Токен создаёт узел игрока и держит у себя, в Redis только хэш. | `TestTokensNeverReachRedis` |
+| Снапшот неизвестной версии удалялся: первая же смена формата стёрла бы живые матчи. | Такие снапшоты не удаляются и не перехватываются, старые версии поднимаются миграциями, повышение версии без миграции валит сборку. | `TestUnknownSnapshotVersionIsKept`, `TestSnapshotMigrationFromPreviousVersion`, `TestAdoptLeavesUnrunnableSnapshots`, `TestSnapshotMigrationExistsForPreviousVersion` |
+| `conns.Add` при остановке гонялся с `conns.Wait`, и соединение принималось уже после `Shutdown`. | Регистрация до upgrade под тем же мьютексом, что закрывает вход. | `TestShutdownDuringUpgrades` |
+| Мелочи: `ping` в очереди без ответа, `node-id` без проверки, чужая блокировка перехвата снималась. | `pong` в очереди, `ValidateNode`, снятие блокировки только своим узлом. | `TestPingIsAnsweredWhileQueued`, `TestNodeIDIsValidated`, `TestAdoptLockReleasedOnlyByItsHolder` |

@@ -47,7 +47,7 @@ jobs:
         with:
           go-version: ${{ matrix.go }}
       # Twice: the concurrency and cluster tests are timing-sensitive, a flake should
-      # show up here rather than on a reviewer's machine.
+      # show up here rather than on somebody else's machine.
       - run: go test -race -count=2 ./...
 
   # The same store, cluster and server tests against a real Redis instead of miniredis:

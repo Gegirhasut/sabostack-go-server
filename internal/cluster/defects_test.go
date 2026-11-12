@@ -1,6 +1,6 @@
 package cluster
 
-// Regression tests for the external code review of 2026-11-12.
+// Regression tests for defects found after the first hardening pass.
 
 import (
 	"context"
@@ -49,7 +49,7 @@ func (h *hangingCluster) Heartbeat(ctx context.Context, ttl time.Duration) error
 // hang for another third of the lease. Other nodes may adopt as soon as the alive key
 // expires (a lease after the last heartbeat was sent), so a match ran on two nodes for
 // several seconds and the moves made on the stale copy were lost.
-func TestReviewNodeFencesBeforeItsLeaseExpires(t *testing.T) {
+func TestNodeFencesBeforeItsLeaseExpires(t *testing.T) {
 	mr := testredis.New(t)
 	rdb := mr.Client
 	defer rdb.Close()
@@ -105,7 +105,7 @@ func (s *slowAdopter) AdoptOrphans(ctx context.Context, max int) (map[string][]b
 // Bug: adoption scans ran on the heartbeat's goroutine, so a slow scan (its timeout was
 // 5 s, half the default lease) delayed heartbeats; the node's alive key could expire
 // while it was healthy, and other nodes would take over its matches.
-func TestReviewSlowAdoptionDoesNotDelayHeartbeats(t *testing.T) {
+func TestSlowAdoptionDoesNotDelayHeartbeats(t *testing.T) {
 	mr := testredis.New(t)
 	rdb := mr.Client
 	defer rdb.Close()
@@ -167,7 +167,7 @@ func queueLen(e *mmEnv) int64 {
 // player's ticket was requeued after 3 s and could be put into a second match, while the
 // first one waited for them until opponent_never_joined. The popping node now records the
 // assignment before publishing, and the waiting node delivers the record.
-func TestReviewLostAssignmentMessageIsRecovered(t *testing.T) {
+func TestLostAssignmentMessageIsRecovered(t *testing.T) {
 	shortRequeue(t)
 	e := newEnv(t)
 	n1 := e.node(t, "n1")
@@ -195,7 +195,7 @@ func TestReviewLostAssignmentMessageIsRecovered(t *testing.T) {
 // Bug (same fix): a popping node that was alive but slow (create took longer than 3 s)
 // had its tickets requeued under it, so its players could end up in two matches. A
 // ticket claimed by a live node is never requeued; one claimed by a dead node still is.
-func TestReviewLiveClaimerIsNotRequeuedDeadOneIs(t *testing.T) {
+func TestLiveClaimerIsNotRequeuedDeadOneIs(t *testing.T) {
 	shortRequeue(t)
 	e := newEnv(t)
 	n1 := e.node(t, "n1")
@@ -217,12 +217,12 @@ func TestReviewLiveClaimerIsNotRequeuedDeadOneIs(t *testing.T) {
 	}
 }
 
-// Second review: a match that started on a fenced node (an adoption racing the fence, or
+// Bug: a match that started on a fenced node (an adoption racing the fence, or
 // a Restore already under way when the lease was lost again) was never stopped: its writes
 // failed with plain Redis errors, not ErrNotOwner, so it ran as a zombie that players
 // reconnecting to this node could join. Fencing and adoption now exclude each other, and
 // every failed heartbeat while fenced stops whatever is running.
-func TestReviewMatchStartedWhileFencedIsStopped(t *testing.T) {
+func TestMatchStartedWhileFencedIsStopped(t *testing.T) {
 	mr := testredis.New(t)
 	rdb := mr.Client
 	defer rdb.Close()
@@ -266,10 +266,10 @@ func waiting(m *Matchmaker) int {
 	return len(m.waiting)
 }
 
-// Second review: a player whose ticket had been popped, and who then disconnected while
+// Bug: a player whose ticket had been popped, and who then disconnected while
 // the assignment was lost, stayed in m.waiting forever (LRem found nothing, so the waiter
 // was never forgotten) and cost a Redis call every second. Leaked for good.
-func TestReviewGoneTicketAfterPopIsForgotten(t *testing.T) {
+func TestGoneTicketAfterPopIsForgotten(t *testing.T) {
 	shortRequeue(t)
 	e := newEnv(t)
 	n1 := e.node(t, "n1")
@@ -300,11 +300,11 @@ func TestReviewGoneTicketAfterPopIsForgotten(t *testing.T) {
 	}
 }
 
-// Third review: a player who left while JoinContext was pushing the ticket could leave a
+// Bug: a player who left while JoinContext was pushing the ticket could leave a
 // ghost in the queue (the lost-ticket check dropped the waiter before the push landed),
 // which was then paired with a real player who waited for opponent_never_joined. A ticket
 // whose player is gone by the time the push returns is taken out at once.
-func TestReviewTicketOfPlayerWhoLeftDuringJoinIsNotQueued(t *testing.T) {
+func TestTicketOfPlayerWhoLeftDuringJoinIsNotQueued(t *testing.T) {
 	e := newEnv(t)
 	n1 := e.node(t, "n1")
 	ctx, leave := context.WithCancel(context.Background())
@@ -318,11 +318,11 @@ func TestReviewTicketOfPlayerWhoLeftDuringJoinIsNotQueued(t *testing.T) {
 	}
 }
 
-// Seventh review: a player's session token was written to Redis in plain text (the
+// Bug: a player's session token was written to Redis in plain text (the
 // assignment record and the pub/sub message), although matches deliberately store only
 // its hash; anyone able to read Redis or run MONITOR could take a player's seat. Tokens
 // are now made by the player's own node and never leave it.
-func TestReviewTokensNeverReachRedis(t *testing.T) {
+func TestTokensNeverReachRedis(t *testing.T) {
 	e := newEnv(t)
 	sub := e.rdb.PSubscribe(context.Background(), "t:*")
 	defer sub.Close()

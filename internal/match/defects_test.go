@@ -1,7 +1,7 @@
 package match
 
-// Regression tests for the bugs found in the external code review of 2026-11-12. Each one
-// fails on b37f934 (the reviewed commit) and passes after the fix.
+// Regression tests for defects found after the first hardening pass. Each one fails
+// on the code before its fix and passes after it.
 
 import (
 	"context"
@@ -27,7 +27,7 @@ import (
 // Bug: Attach reset LastInput to "now" and the end of the pause then shifted it forward by
 // the whole pause again, so after 15 s away a player's LastInput was 15 s in the future:
 // 45 s instead of 30 s until the idle forfeit. Repeated disconnects stretched it further.
-func TestReviewReconnectAddsIdleCredit(t *testing.T) {
+func TestReconnectAddsIdleCredit(t *testing.T) {
 	cfg := testConfig()
 	cfg.Gravity = time.Hour // nobody tops out while we wait
 	m, tokens, sinks, start := newPlaying(t, cfg)
@@ -61,7 +61,7 @@ func TestReviewReconnectAddsIdleCredit(t *testing.T) {
 
 // Bug (same line): replacing a live connection with a new one also reset LastInput, so a
 // player who never moved could dodge the idle forfeit forever by reconnecting every 20 s.
-func TestReviewReplacingConnectionResetsIdle(t *testing.T) {
+func TestReplacingConnectionResetsIdle(t *testing.T) {
 	cfg := testConfig()
 	cfg.Gravity = time.Hour
 	m, tokens, _, start := newPlaying(t, cfg)
@@ -100,7 +100,7 @@ func (f *flakyStore) Save(ctx context.Context, id string, data []byte) error {
 // Bug: a snapshot write that failed (or was skipped by the open circuit breaker) was
 // counted as written. A match whose state did not change after that was only written
 // again by the forced re-snapshot, 10 s later, so a crash in between lost it.
-func TestReviewFailedSnapshotIsRetried(t *testing.T) {
+func TestFailedSnapshotIsRetried(t *testing.T) {
 	st := &flakyStore{plainStore: newPlain()}
 	st.fail.Store(1)
 	opts := DefaultOptions()
@@ -128,12 +128,12 @@ func (s laggyStore) Save(ctx context.Context, id string, data []byte) error {
 	return s.plainStore.mem.Save(ctx, id, data)
 }
 
-// Found by running the cluster tests against a real Redis (fourth review round): Create
+// Found by running the cluster tests against a real Redis: Create
 // returned, and players were told about the match, while its first snapshot (which also
 // records its owner) was still queued. A resume reaching another node in that window got
 // match_not_found, final for the client; a crash in it lost a match players had been
 // sent to. Create now returns only once the match is in the store.
-func TestReviewMatchIsStoredBeforeItIsAnnounced(t *testing.T) {
+func TestMatchIsStoredBeforeItIsAnnounced(t *testing.T) {
 	st := laggyStore{newPlain()}
 	mgr := NewManager(DefaultOptions(), clock.Real{}, st, metrics.New(prometheus.NewRegistry()), slog.New(slog.NewTextHandler(io.Discard, nil)))
 	defer mgr.Shutdown(context.Background())
@@ -167,11 +167,11 @@ func (g *gatedStore) Save(ctx context.Context, id string, data []byte) error {
 	return g.plainStore.mem.Save(ctx, id, data)
 }
 
-// Fourth review, note 3: the first write that Create waits for went to the back of the
+// Bug: the first write that Create waits for went to the back of the
 // shard's queue, behind every periodic snapshot already waiting there, so a burst of
 // load slowed matchmaking down with the write queue. Writes someone waits for now go
 // first.
-func TestReviewAwaitedWriteSkipsTheQueue(t *testing.T) {
+func TestAwaitedWriteSkipsTheQueue(t *testing.T) {
 	st := &gatedStore{plainStore: newPlain(), gate: make(chan struct{})}
 	opts := DefaultOptions()
 	opts.PersistWorkers, opts.PersistBatch = 1, 8 // one shard, small batches
@@ -212,10 +212,10 @@ func TestReviewAwaitedWriteSkipsTheQueue(t *testing.T) {
 	}
 }
 
-// Fifth review, note 2: with more awaited writes than a batch holds arriving all the
+// Bug: with more awaited writes than a batch holds arriving all the
 // time, routine snapshots on that shard would have waited indefinitely. Awaited writes
 // now take at most half a batch while routine ones are queued.
-func TestReviewAwaitedWritesDoNotStarveRoutineOnes(t *testing.T) {
+func TestAwaitedWritesDoNotStarveRoutineOnes(t *testing.T) {
 	st := &gatedStore{plainStore: newPlain(), gate: make(chan struct{})}
 	opts := DefaultOptions()
 	opts.PersistWorkers, opts.PersistBatch = 1, 8
@@ -266,12 +266,12 @@ func withVersion(t *testing.T, data []byte, v int) []byte {
 	return out
 }
 
-// Seventh review: any snapshot Restore could not read was deleted, and a version
+// Bug: any snapshot Restore could not read was deleted, and a version
 // mismatch counted as unreadable. The first deploy that changed the format would have
 // had restarting nodes delete their own final snapshots, and new nodes delete the matches
 // they took over from old ones: every live match lost exactly when recovery should save
 // it. Snapshots of an unknown version are now left alone.
-func TestReviewUnknownSnapshotVersionIsKept(t *testing.T) {
+func TestUnknownSnapshotVersionIsKept(t *testing.T) {
 	cfg := testConfig()
 	m, _ := New("future", cfg, [2]string{"a", "b"}, 1, t0)
 	data, err := m.FinalSnapshot(t0)
@@ -302,7 +302,7 @@ func TestReviewUnknownSnapshotVersionIsKept(t *testing.T) {
 
 // The other half of the fix: a build that bumps the version registers a migration from
 // the previous one, and the previous build's snapshots still restore.
-func TestReviewSnapshotMigrationFromPreviousVersion(t *testing.T) {
+func TestSnapshotMigrationFromPreviousVersion(t *testing.T) {
 	m, _ := New("old", testConfig(), [2]string{"a", "b"}, 1, t0)
 	data, _ := m.FinalSnapshot(t0)
 	old := withVersion(t, data, snapshotVersion-1)
@@ -321,7 +321,7 @@ func TestReviewSnapshotMigrationFromPreviousVersion(t *testing.T) {
 	}
 }
 
-// Eighth review: unknown versions are kept, but a node with a stable id (a StatefulSet
+// Bug: unknown versions are kept, but a node with a stable id (a StatefulSet
 // pod) that comes back on a new snapshot version still owns its old-format matches and
 // cannot run them; nobody else takes them while it is alive. So bumping the version
 // without a migration from the previous one loses those matches in practice. This test
