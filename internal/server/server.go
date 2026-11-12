@@ -25,6 +25,7 @@ import (
 	"github.com/Gegirhasut/sabostack-go-server/internal/metrics"
 	"github.com/Gegirhasut/sabostack-go-server/internal/protocol"
 	"github.com/Gegirhasut/sabostack-go-server/internal/store"
+	"github.com/Gegirhasut/sabostack-go-server/internal/wire"
 )
 
 // Config holds the transport and abuse-protection settings.
@@ -46,6 +47,10 @@ type Config struct {
 
 	PublicMetrics bool   // also serve /metrics on the public handler
 	NodeID        string // this node's id, to tell local from remote owners on resume
+
+	// BinaryFullFrames sends binary clients a full state frame every time instead of a
+	// delta. For measuring what the format alone saves; leave it off in production.
+	BinaryFullFrames bool
 }
 
 // DefaultConfig returns safe defaults. The heartbeat keeps the original tolerant timings:
@@ -106,7 +111,9 @@ func NewWithConfig(mgr *match.Manager, met *metrics.Metrics, gatherer prometheus
 		limits: connLimits{
 			pingInterval: cfg.PingInterval, pongWait: cfg.PongWait,
 			rate: cfg.InputRate, burst: cfg.InputBurst,
+			wireDelta:   !cfg.BinaryFullFrames,
 			rateLimited: met.Input("rate_limited"), kicked: met.Kicked,
+			traffic: newTraffic(met),
 		},
 	}
 	for _, o := range cfg.AllowedOrigins {
@@ -117,8 +124,19 @@ func NewWithConfig(mgr *match.Manager, met *metrics.Metrics, gatherer prometheus
 	// Default buffer sizes on purpose: gorilla then reuses the 4 KB buffers net/http
 	// already allocated for the connection. A WriteBufferPool was measured to add heap
 	// (≈ +8 MB at 4000 connections), not save it.
-	s.upgrader = websocket.Upgrader{CheckOrigin: s.checkOrigin}
+	s.upgrader = websocket.Upgrader{CheckOrigin: s.checkOrigin, Subprotocols: []string{wire.Subprotocol}}
 	return s
+}
+
+func newTraffic(met *metrics.Metrics) *traffic {
+	t := &traffic{}
+	for d, dir := range [2]string{"in", "out"} {
+		for f, format := range [2]string{"json", "binary"} {
+			t.bytes[d][f] = met.WSBytes.WithLabelValues(dir, format)
+			t.frames[d][f] = met.WSFrames.WithLabelValues(dir, format)
+		}
+	}
+	return t
 }
 
 func (s *Server) checkOrigin(r *http.Request) bool {
@@ -261,7 +279,9 @@ func (s *Server) handleWS(w http.ResponseWriter, r *http.Request) {
 	s.metrics.ConnectedPlayers.Inc()
 	defer s.metrics.ConnectedPlayers.Dec()
 
-	c := newClient(ws, s.limits)
+	// A client that asked for wire.Subprotocol gets binary state frames; any other
+	// client speaks JSON only.
+	c := newClient(ws, s.limits, ws.Subprotocol() == wire.Subprotocol)
 	defer func() { c.Close("bye"); <-c.done }()
 	in := c.readLoop()
 	log := s.log.With("remote", ip)

@@ -40,6 +40,7 @@ type result struct {
 	InputsSent       int64   `json:"inputsSent"`
 	MsgsPerSecond    float64 `json:"msgsPerSecond"`
 	MBReceived       float64 `json:"mbReceived"`
+	Violations       int64   `json:"violations"`
 	AckP50Ms         float64 `json:"ackP50Ms"`
 	AckP95Ms         float64 `json:"ackP95Ms"`
 	AckP99Ms         float64 `json:"ackP99Ms"`
@@ -115,7 +116,9 @@ func main() {
 		"soak":          soakSection(soak),
 		"storm":         stormSection(storm),
 		"compare-hardening": compareTable(filepath.Join(*dir, "hardening"), []string{"before", "after"},
-			map[string]string{"before": "до", "after": "после"}),
+			map[string]string{"before": "до", "after": "после"}, false),
+		"compare-wire": compareTable(filepath.Join(*dir, "wire"), []string{"stage1", "json", "bin-full", "bin"},
+			map[string]string{"stage1": "JSON, до этапа", "json": "JSON", "bin-full": "бинарный, полные кадры", "bin": "бинарный, дельты"}, true),
 	}
 
 	b, err := os.ReadFile(*doc)
@@ -140,7 +143,9 @@ func main() {
 // <variant>-<pairs>[-r<k>].json and <variant>-storm-<pairs>[-r<k>].json; repeats of one
 // variant and step are reduced to their median, because single runs on a shared host are
 // noisy in the tail.
-func compareTable(dir string, variants []string, names map[string]string) string {
+// checked adds the bots' invariant-violation count (bots with check.go; the older runs
+// did not check).
+func compareTable(dir string, variants []string, names map[string]string, checked bool) string {
 	type key struct {
 		variant string
 		storm   bool
@@ -185,8 +190,13 @@ func compareTable(dir string, variants []string, names map[string]string) string
 		return (vs[len(vs)/2-1] + vs[len(vs)/2]) / 2
 	}
 	var b strings.Builder
-	b.WriteString("| Пар | Версия | Прогонов | Input→ack p50 / p95 / p99 (мс) | CPU сервера, % ядра | RSS сервера, МБ (сред.) | Трафик на клиента, КБ/с | Матчей | Ошибок / обрывов |\n")
-	b.WriteString("|---:|---|---:|---:|---:|---:|---:|---:|---:|\n")
+	b.WriteString("| Пар | Версия | Прогонов | Input→ack p50 / p95 / p99 (мс) | CPU сервера, % ядра | RSS сервера, МБ (сред.) | Трафик на клиента, КБ/с | Матчей | Ошибок / обрывов |")
+	sep := "|---:|---|---:|---:|---:|---:|---:|---:|---:|"
+	if checked {
+		b.WriteString(" Нарушений |")
+		sep += "---:|"
+	}
+	b.WriteString("\n" + sep + "\n")
 	for _, st := range steps {
 		for _, v := range variants {
 			rs := runs[key{v, st.storm, st.pairs}]
@@ -197,13 +207,14 @@ func compareTable(dir string, variants []string, names map[string]string) string
 			if st.storm {
 				label += " (шторм)"
 			}
-			var errs, drops int64
+			var errs, drops, violations int64
 			for _, r := range rs {
 				errs += r.Errors
 				drops += r.Dropped
+				violations += r.Violations
 			}
 			kbps := med(rs, func(r *result) float64 { return r.MBReceived * 1e6 / 1024 / r.MeasureSeconds / float64(r.Bots) })
-			fmt.Fprintf(&b, "| %s | %s | %d | %.1f / %.1f / %.1f | %.0f | %.0f | %.2f | %.0f | %d / %d |\n",
+			fmt.Fprintf(&b, "| %s | %s | %d | %.1f / %.1f / %.1f | %.0f | %.0f | %.2f | %.0f | %d / %d |",
 				label, names[v], len(rs),
 				med(rs, func(r *result) float64 { return r.AckP50Ms }),
 				med(rs, func(r *result) float64 { return r.AckP95Ms }),
@@ -213,6 +224,10 @@ func compareTable(dir string, variants []string, names map[string]string) string
 				kbps,
 				med(rs, func(r *result) float64 { return float64(r.MatchesFinished) }),
 				errs, drops)
+			if checked {
+				fmt.Fprintf(&b, " %d |", violations)
+			}
+			b.WriteString("\n")
 		}
 	}
 	return b.String()

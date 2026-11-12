@@ -2,6 +2,10 @@
 // matched and play random moves. With -duration they re-queue after every match, which
 // keeps the load constant for a fixed time. While running it scrapes the server's
 // /metrics once per second, and at the end prints a summary (optionally also as JSON).
+//
+// With -proto bin the bots use the binary wire protocol (WebSocket subprotocol
+// sabostack.bin.v1): inputs are sent as binary frames and every state delta is decoded
+// and applied to the bot's copy of the match state, as a real client would.
 package main
 
 import (
@@ -25,6 +29,7 @@ import (
 
 	"github.com/Gegirhasut/sabostack-go-server/internal/game"
 	"github.com/Gegirhasut/sabostack-go-server/internal/protocol"
+	"github.com/Gegirhasut/sabostack-go-server/internal/wire"
 )
 
 type config struct {
@@ -37,6 +42,7 @@ type config struct {
 	Warmup     time.Duration `json:"warmup"`   // after the ramp, before measuring
 	StormAt    time.Duration `json:"stormAt"`  // 0 = no reconnect storm
 	StormFrac  float64       `json:"stormFraction"`
+	Proto      string        `json:"proto"` // "json" or "bin"
 	Label      string        `json:"label"`
 }
 
@@ -48,6 +54,8 @@ type stats struct {
 
 	matches, errors, dropped  atomic.Int64
 	msgs, bytes, inputs       atomic.Int64
+	bytesSent                 atomic.Int64
+	violations, printed       atomic.Int64 // protocol/game invariant violations (check.go)
 	stormTried, stormOK       atomic.Int64
 	stormFailed, stormSkipped atomic.Int64
 
@@ -76,9 +84,14 @@ func main() {
 	flag.DurationVar(&c.Warmup, "warmup", 10*time.Second, "with -duration: settle time after the ramp before measuring")
 	flag.DurationVar(&c.StormAt, "storm-at", 0, "with -duration: drop and resume -storm-frac of the bots this long after measuring starts")
 	flag.Float64Var(&c.StormFrac, "storm-frac", 0.2, "fraction of bots dropped in the reconnect storm")
+	flag.StringVar(&c.Proto, "proto", "json", "wire protocol: json, or bin (binary state deltas)")
 	flag.StringVar(&c.Label, "label", "", "run label stored in the JSON output")
 	jsonOut := flag.String("json", "", "also write the result as JSON to this file")
 	flag.Parse()
+	if c.Proto != "json" && c.Proto != "bin" {
+		fmt.Fprintln(os.Stderr, "-proto must be json or bin")
+		os.Exit(2)
+	}
 
 	res := run(c)
 	res.print()
@@ -196,33 +209,60 @@ func (b *bot) loop(ctx context.Context) {
 	}
 }
 
-type conn struct {
-	ws   *websocket.Conn
-	in   chan []byte
-	done chan struct{}
+type frame struct {
+	binary bool
+	b      []byte
 }
 
-func dial(ctx context.Context, url string) (*conn, error) {
-	ws, _, err := websocket.DefaultDialer.DialContext(ctx, url, nil)
+type conn struct {
+	ws     *websocket.Conn
+	binary bool
+	in     chan frame
+	done   chan struct{}
+}
+
+func dial(ctx context.Context, url string, binary bool) (*conn, error) {
+	d := *websocket.DefaultDialer
+	if binary {
+		d.Subprotocols = []string{wire.Subprotocol}
+	}
+	ws, _, err := d.DialContext(ctx, url, nil)
 	if err != nil {
 		return nil, err
 	}
-	c := &conn{ws: ws, in: make(chan []byte, 64), done: make(chan struct{})}
+	if binary && ws.Subprotocol() != wire.Subprotocol {
+		ws.Close()
+		return nil, errors.New("server did not accept the binary subprotocol")
+	}
+	c := &conn{ws: ws, binary: binary, in: make(chan frame, 64), done: make(chan struct{})}
 	go func() {
 		defer close(c.in)
 		for {
-			_, b, err := ws.ReadMessage()
+			mt, b, err := ws.ReadMessage()
 			if err != nil {
 				return
 			}
 			select {
-			case c.in <- b:
+			case c.in <- frame{mt == websocket.BinaryMessage, b}:
 			case <-c.done:
 				return
 			}
 		}
 	}()
 	return c, nil
+}
+
+// sendInput sends one input in the connection's protocol and returns the bytes written.
+func (c *conn) sendInput(seq uint64, a game.Action, buf []byte) ([]byte, int, error) {
+	if c.binary {
+		buf = wire.AppendInput(buf[:0], seq, a)
+		return buf, len(buf), c.ws.WriteMessage(websocket.BinaryMessage, buf)
+	}
+	b, err := json.Marshal(protocol.ClientMsg{Type: protocol.TypeInput, Seq: seq, Action: a})
+	if err != nil {
+		return buf, 0, err
+	}
+	return buf, len(b), c.ws.WriteMessage(websocket.TextMessage, b)
 }
 
 func (c *conn) close() {
@@ -242,12 +282,17 @@ type serverMsg struct {
 	Token   string         `json:"token"`
 	Event   protocol.Event `json:"event"`
 	State   protocol.State `json:"state"`
+	// snapshot
+	Events         []protocol.Event `json:"events"`
+	EventsComplete bool             `json:"eventsComplete"`
 }
 
 // playMatch runs one match. A single goroutine owns all bot state; a reader goroutine per
 // socket only forwards raw frames.
 func (b *bot) playMatch(ctx context.Context, every time.Duration) error {
-	c, err := dial(ctx, b.cfg.URL)
+	bin := b.cfg.Proto == "bin"
+	chk := &checker{bot: b.name, violations: &b.st.violations, printed: &b.st.printed}
+	c, err := dial(ctx, b.cfg.URL, bin)
 	if err != nil {
 		return err
 	}
@@ -263,7 +308,10 @@ func (b *bot) playMatch(ctx context.Context, every time.Duration) error {
 		seq            uint64
 		sent           = map[uint64]time.Time{}
 		storm          = b.storm
-		droppedAt      time.Time // non-zero while waiting for the resume snapshot
+		droppedAt      time.Time      // non-zero while waiting for the resume snapshot
+		state          protocol.State // binary mode: base for the next delta
+		haveState      bool
+		inBuf          []byte
 	)
 	ack := func(upto uint64, now time.Time) {
 		for s, at := range sent {
@@ -283,14 +331,33 @@ func (b *bot) playMatch(ctx context.Context, every time.Duration) error {
 		case <-ctx.Done():
 			return nil
 
-		case raw, ok := <-c.in:
+		case fr, ok := <-c.in:
 			if !ok {
 				return errDropped
 			}
+			raw := fr.b
 			now := time.Now()
 			if b.st.measuring.Load() {
 				b.st.msgs.Add(1)
 				b.st.bytes.Add(int64(len(raw)))
+			}
+			if fr.binary {
+				if len(raw) == 0 || raw[0] != wire.TypeState {
+					continue // pong
+				}
+				var base *protocol.State
+				if haveState {
+					base = &state
+				}
+				next, err := wire.DecodeState(base, raw)
+				if err != nil {
+					return fmt.Errorf("bad state frame: %w", err)
+				}
+				state, haveState = next, true
+				chk.state(state)
+				playing = state.Phase == "playing" && !state.Paused
+				ack(state.Ack, now)
+				continue
 			}
 			var m serverMsg
 			if json.Unmarshal(raw, &m) != nil {
@@ -300,9 +367,15 @@ func (b *bot) playMatch(ctx context.Context, every time.Duration) error {
 			case protocol.TypeMatched:
 				matchID, token = m.MatchID, m.Token
 			case protocol.TypeState:
-				playing = m.Phase == "playing" && !m.State.Paused
+				var st protocol.State
+				if json.Unmarshal(raw, &st) == nil {
+					chk.state(st)
+				}
+				playing = m.Phase == "playing" && !st.Paused
 				ack(m.Ack, now)
 			case protocol.TypeSnapshot:
+				chk.snapshot(protocol.Snapshot{State: m.State, Events: m.Events, EventsComplete: m.EventsComplete})
+				state, haveState = m.State, true
 				playing = m.State.Phase == "playing"
 				ack(m.State.Ack, now)
 				if !droppedAt.IsZero() {
@@ -313,6 +386,7 @@ func (b *bot) playMatch(ctx context.Context, every time.Duration) error {
 					droppedAt = time.Time{}
 				}
 			case protocol.TypeEvent:
+				chk.event(m.Event)
 				lastEvent = m.Event.Seq
 				if m.Event.Kind == protocol.EvMatchOver {
 					if b.st.measuring.Load() {
@@ -336,7 +410,8 @@ func (b *bot) playMatch(ctx context.Context, every time.Duration) error {
 			b.st.stormTried.Add(1)
 			droppedAt = time.Now()
 			c.close()
-			nc, err := dial(ctx, b.cfg.URL)
+			haveState = false // the new connection starts from its snapshot
+			nc, err := dial(ctx, b.cfg.URL, bin)
 			if err != nil {
 				b.st.stormFailed.Add(1)
 				return err
@@ -359,15 +434,18 @@ func (b *bot) playMatch(ctx context.Context, every time.Duration) error {
 			}
 			seq++
 			sent[seq] = time.Now()
+			chk.sent(seq)
 			a := actions[rand.IntN(len(actions))]
 			if rand.IntN(3) == 0 { // bias towards drops so rounds finish
 				a = game.HardDrop
 			}
-			if err := c.ws.WriteJSON(protocol.ClientMsg{Type: protocol.TypeInput, Seq: seq, Action: a}); err != nil {
+			var n int
+			if inBuf, n, err = c.sendInput(seq, a, inBuf); err != nil {
 				return errDropped
 			}
 			if b.st.measuring.Load() {
 				b.st.inputs.Add(1)
+				b.st.bytesSent.Add(int64(n))
 			}
 		}
 	}
@@ -388,6 +466,8 @@ type sample struct {
 	TickCount     float64 `json:"tickCount"`
 	TickMax       float64 `json:"tickMax"`
 	MsgsReceived  int64   `json:"msgsReceived"` // bot-side, measuring window only
+	WSBytesOut    float64 `json:"wsBytesOut"`   // server-side payload bytes sent (all formats)
+	WSBytesIn     float64 `json:"wsBytesIn"`
 }
 
 type sampler struct {
@@ -431,6 +511,14 @@ func (s *sampler) scrapeNow() {
 			continue
 		}
 		v, _ := strconv.ParseFloat(f[1], 64)
+		if strings.HasPrefix(f[0], "sabostack_ws_bytes_total{") {
+			if strings.Contains(f[0], `dir="out"`) {
+				smp.WSBytesOut += v
+			} else {
+				smp.WSBytesIn += v
+			}
+			continue
+		}
 		switch f[0] {
 		case "process_cpu_seconds_total":
 			smp.CPUSeconds = v
@@ -467,11 +555,17 @@ type result struct {
 	MeasureSeconds  float64 `json:"measureSeconds"`
 	MatchesFinished int64   `json:"matchesFinished"` // match_over seen by bots, /2
 	Errors          int64   `json:"errors"`
+	Violations      int64   `json:"violations"` // protocol/game invariant violations seen by bots
 	Dropped         int64   `json:"droppedConnections"`
 	InputsSent      int64   `json:"inputsSent"`
 	MsgsReceived    int64   `json:"msgsReceived"`
 	MsgsPerSecond   float64 `json:"msgsPerSecond"`
 	MBReceived      float64 `json:"mbReceived"`
+	MBSent          float64 `json:"mbSent"` // input frames, bot-side
+
+	// Server-side traffic over the measuring window, per connected client.
+	ServerOutKBps float64 `json:"serverOutKBpsPerClient"`
+	ServerInKBps  float64 `json:"serverInKBpsPerClient"`
 
 	AckSamples int     `json:"ackSamples"`
 	AckP50Ms   float64 `json:"ackP50Ms"`
@@ -527,9 +621,11 @@ func summarize(c config, st *stats, smp *sampler, start, rampDone, mStart, mEnd 
 	r.MeasureSeconds = mEnd.Sub(mStart).Seconds()
 	r.MatchesFinished = st.matches.Load() / 2
 	r.Errors, r.Dropped = st.errors.Load(), st.dropped.Load()
+	r.Violations = st.violations.Load()
 	r.InputsSent, r.MsgsReceived = st.inputs.Load(), st.msgs.Load()
 	r.MsgsPerSecond = float64(r.MsgsReceived) / r.MeasureSeconds
 	r.MBReceived = float64(st.bytes.Load()) / 1e6
+	r.MBSent = float64(st.bytesSent.Load()) / 1e6
 
 	st.mu.Lock()
 	slices.Sort(st.ack)
@@ -596,6 +692,10 @@ func summarize(c config, st *stats, smp *sampler, start, rampDone, mStart, mEnd 
 	r.LiveMatchesAvg /= n
 	r.RSSMBAvg /= n
 	r.GoroutinesAvg /= n
+	if r.ConnectionsAvg > 0 {
+		r.ServerOutKBps = (last.WSBytesOut - first.WSBytesOut) / dt / r.ConnectionsAvg / 1024
+		r.ServerInKBps = (last.WSBytesIn - first.WSBytesIn) / dt / r.ConnectionsAvg / 1024
+	}
 	return r
 }
 
@@ -604,8 +704,9 @@ func (r *result) print() {
 	fmt.Printf("ramp / measured:    %.1fs / %.1fs\n", r.RampSeconds, r.MeasureSeconds)
 	fmt.Printf("matches finished:   %d\n", r.MatchesFinished)
 	fmt.Printf("errors / dropped:   %d / %d\n", r.Errors, r.Dropped)
+	fmt.Printf("violations:         %d\n", r.Violations)
 	fmt.Printf("inputs sent:        %d\n", r.InputsSent)
-	fmt.Printf("messages received:  %d (%.0f/s, %.1f MB)\n", r.MsgsReceived, r.MsgsPerSecond, r.MBReceived)
+	fmt.Printf("messages received:  %d (%.0f/s, %.1f MB); inputs sent: %.1f MB (%s)\n", r.MsgsReceived, r.MsgsPerSecond, r.MBReceived, r.MBSent, r.Config.Proto)
 	fmt.Printf("input->ack latency: p50=%.1fms p95=%.1fms p99=%.1fms max=%.1fms (n=%d)\n", r.AckP50Ms, r.AckP95Ms, r.AckP99Ms, r.AckMaxMs, r.AckSamples)
 	if r.Samples != nil {
 		fmt.Printf("server connections: avg %.0f, min %.0f; live matches avg %.0f (%.0f incl. lingering)\n", r.ConnectionsAvg, r.ConnectionsMin, r.LiveMatchesAvg, r.ActiveMatchesAvg)
@@ -613,6 +714,9 @@ func (r *result) print() {
 		fmt.Printf("server RSS:         avg %.1f MB, max %.1f MB (start %.1f, end %.1f)\n", r.RSSMBAvg, r.RSSMBMax, r.RSSMBStart, r.RSSMBEnd)
 		fmt.Printf("server goroutines:  avg %.0f (start %.0f, end %.0f)\n", r.GoroutinesAvg, r.GoroutinesStart, r.GoroutinesEnd)
 		fmt.Printf("server tick:        mean %.1fµs, max %.2fms\n", r.TickMeanUs, r.TickMaxMs)
+		if r.ServerOutKBps > 0 {
+			fmt.Printf("server traffic:     %.2f KB/s out, %.2f KB/s in per client\n", r.ServerOutKBps, r.ServerInKBps)
+		}
 	}
 	if s := r.Storm; s != nil {
 		fmt.Printf("reconnect storm:    %d selected, %d in a match, %d recovered (%.1f%%), %d failed; recovery p50=%.1fms p95=%.1fms max=%.1fms\n",

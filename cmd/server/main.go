@@ -59,6 +59,7 @@ func main() {
 	flag.Float64Var(&c.srv.InputBurst, "input-burst", c.srv.InputBurst, "burst allowance for -input-rate")
 	flag.DurationVar(&c.srv.PingInterval, "ping-interval", c.srv.PingInterval, "server WebSocket ping interval")
 	flag.DurationVar(&c.srv.PongWait, "pong-wait", c.srv.PongWait, "a silent socket is considered dead after this")
+	flag.BoolVar(&c.srv.BinaryFullFrames, "binary-full-frames", false, "send binary clients full state frames instead of deltas (for measurements)")
 	flag.DurationVar(&c.opts.Match.TickInterval, "tick", c.opts.Match.TickInterval, "server tick interval")
 	flag.DurationVar(&c.opts.Match.Gravity, "gravity", c.opts.Match.Gravity, "gravity interval")
 	flag.DurationVar(&c.opts.Match.Countdown, "countdown", c.opts.Match.Countdown, "countdown before each round")

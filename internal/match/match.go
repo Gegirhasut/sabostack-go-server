@@ -479,9 +479,13 @@ func (m *Match) Broadcast(now time.Time) {
 		return
 	}
 	m.dirty = false
+	// The two recipients' states differ only in Ack, so the player views (two boards of
+	// row strings) are built once and shared read-only by both messages.
+	st := m.StateFor(NoSeat, now)
 	for i, s := range m.Seats {
 		if s.sink != nil {
-			s.sink.Send(m.StateFor(i, now))
+			st.Ack = m.Seats[i].LastSeq
+			s.sink.Send(st)
 		}
 	}
 }

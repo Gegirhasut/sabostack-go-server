@@ -1,6 +1,7 @@
 package server
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -12,6 +13,7 @@ import (
 	"github.com/prometheus/client_golang/prometheus"
 
 	"github.com/Gegirhasut/sabostack-go-server/internal/protocol"
+	"github.com/Gegirhasut/sabostack-go-server/internal/wire"
 )
 
 const (
@@ -22,13 +24,34 @@ const (
 	outboxSize = 128
 )
 
+const (
+	dirIn, dirOut      = 0, 1
+	fmtJSON, fmtBinary = 0, 1
+)
+
+// traffic counts WebSocket payload bytes and frames by direction and format. A nil
+// counter (unit tests) is skipped.
+type traffic struct {
+	bytes, frames [2][2]prometheus.Counter
+}
+
+func (t *traffic) add(dir, format, n int) {
+	if t == nil || t.bytes[dir][format] == nil {
+		return
+	}
+	t.bytes[dir][format].Add(float64(n))
+	t.frames[dir][format].Inc()
+}
+
 // connLimits are the per-connection knobs taken from Config.
 type connLimits struct {
 	pingInterval time.Duration
 	pongWait     time.Duration
 	rate, burst  float64 // client messages per second (token bucket); rate 0 = unlimited
+	wireDelta    bool    // binary clients get state deltas (false: full binary frames)
 	rateLimited  prometheus.Counter
 	kicked       *prometheus.CounterVec // by reason; nil in unit tests
+	traffic      *traffic
 }
 
 func (l connLimits) kick(reason string) {
@@ -45,9 +68,15 @@ func (l connLimits) kick(reason string) {
 // therefore just sees fewer frames instead of being disconnected. Events, snapshots and
 // errors are queued in order and never dropped; a client that falls outboxSize of those
 // behind is disconnected (it can resume and get a fresh snapshot).
+//
+// A binary client (subprotocol wire.Subprotocol) gets state and pong as binary frames.
+// States are deltas against base, the last state this connection actually wrote: the
+// writer is the only goroutine that knows what the client has, and computing the delta
+// here keeps it consistent with conflation (a dropped state never becomes a base).
 type client struct {
 	ws     *websocket.Conn
 	limits connLimits
+	binary bool
 	ctx    context.Context // cancelled when the socket is gone
 	cancel context.CancelFunc
 
@@ -58,16 +87,20 @@ type client struct {
 	pinned   int // queued messages that are not states
 	wake     chan struct{}
 
+	// Writer goroutine only.
+	base *protocol.State
+	enc  []byte
+
 	quit      chan struct{}
 	closeOnce sync.Once
 	reason    string
 	done      chan struct{} // writer exited
 }
 
-func newClient(ws *websocket.Conn, limits connLimits) *client {
+func newClient(ws *websocket.Conn, limits connLimits, binary bool) *client {
 	ctx, cancel := context.WithCancel(context.Background())
 	c := &client{
-		ws: ws, limits: limits, ctx: ctx, cancel: cancel, stateIdx: -1,
+		ws: ws, limits: limits, binary: binary, ctx: ctx, cancel: cancel, stateIdx: -1,
 		wake: make(chan struct{}, 1), quit: make(chan struct{}), done: make(chan struct{}),
 	}
 	go c.writeLoop()
@@ -174,12 +207,46 @@ func (c *client) writeLoop() {
 }
 
 func (c *client) write(msg any) error {
+	if c.binary {
+		switch m := msg.(type) {
+		case protocol.State:
+			var prev *protocol.State
+			if c.limits.wireDelta {
+				prev = c.base
+			}
+			if b, err := wire.AppendState(c.enc[:0], prev, &m); err == nil {
+				c.enc, c.base = b, &m
+				return c.send(websocket.BinaryMessage, b)
+			}
+			// Not encodable (never for a real match): fall through to JSON, which the
+			// client reads as a full state.
+			c.base = &m
+		case protocol.Pong:
+			c.enc = wire.AppendPong(c.enc[:0], m.T)
+			return c.send(websocket.BinaryMessage, c.enc)
+		case protocol.Snapshot:
+			st := m.State
+			c.base = &st // the client's state is now the snapshot's
+		}
+	}
 	b, err := json.Marshal(msg)
 	if err != nil {
 		return err
 	}
+	return c.send(websocket.TextMessage, b)
+}
+
+func (c *client) send(messageType int, b []byte) error {
 	_ = c.ws.SetWriteDeadline(time.Now().Add(writeWait))
-	return c.ws.WriteMessage(websocket.TextMessage, b)
+	if err := c.ws.WriteMessage(messageType, b); err != nil {
+		return err
+	}
+	format := fmtJSON
+	if messageType == websocket.BinaryMessage {
+		format = fmtBinary
+	}
+	c.limits.traffic.add(dirOut, format, len(b))
+	return nil
 }
 
 // bucket is a token bucket: rate tokens per second, up to burst.
@@ -205,11 +272,13 @@ func (b *bucket) allow(now time.Time) bool {
 }
 
 // readLoop decodes client messages into the returned channel, which is closed when the
-// socket fails or closes.
+// socket fails or closes. Text frames are JSON, binary frames are wire frames (input,
+// ping); both decode to the same protocol.ClientMsg.
 //
-// Every message passes a token bucket (limits.rate/burst). Over the limit, messages are
-// dropped (an un-acked input may be resent; inputs are idempotent). A client that keeps
-// flooding exhausts a second "abuse" bucket and is disconnected.
+// Every frame passes a token bucket (limits.rate/burst) before it is decoded, so a flood
+// of malformed frames is limited like any other. Over the limit, frames are dropped (an
+// un-acked input may be resent; inputs are idempotent). A client that keeps flooding
+// exhausts a second "abuse" bucket and is disconnected.
 func (c *client) readLoop() <-chan protocol.ClientMsg {
 	in := make(chan protocol.ClientMsg, 16)
 	c.ws.SetReadLimit(maxMsgBytes)
@@ -223,19 +292,14 @@ func (c *client) readLoop() <-chan protocol.ClientMsg {
 	go func() {
 		defer close(in)
 		defer c.cancel()
+		var buf bytes.Buffer
 		for {
-			var msg protocol.ClientMsg
-			if err := c.ws.ReadJSON(&msg); err != nil {
-				var syntax *json.SyntaxError
-				var typ *json.UnmarshalTypeError
-				switch {
-				case errors.As(err, &syntax):
-					c.Send(errMsg("bad_json", err.Error()))
-					continue
-				case errors.As(err, &typ):
-					c.Send(errMsg("bad_request", err.Error()))
-					continue
-				}
+			mt, r, err := c.ws.NextReader()
+			if err == nil {
+				buf.Reset()
+				_, err = buf.ReadFrom(r)
+			}
+			if err != nil {
 				var ne net.Error
 				if errors.As(err, &ne) && ne.Timeout() {
 					c.limits.kick("pong_timeout") // silent peer: no message or pong within pongWait
@@ -244,8 +308,13 @@ func (c *client) readLoop() <-chan protocol.ClientMsg {
 			}
 			now := time.Now()
 			_ = c.ws.SetReadDeadline(now.Add(c.limits.pongWait))
+			format := fmtJSON
+			if mt == websocket.BinaryMessage {
+				format = fmtBinary
+			}
+			c.limits.traffic.add(dirIn, format, buf.Len())
 			if limit != nil && !limit.allow(now) {
-				if msg.Type == protocol.TypeInput && c.limits.rateLimited != nil {
+				if c.limits.rateLimited != nil {
 					c.limits.rateLimited.Inc()
 				}
 				if !abuse.allow(now) {
@@ -256,6 +325,16 @@ func (c *client) readLoop() <-chan protocol.ClientMsg {
 				}
 				continue
 			}
+			msg, err := decodeClient(format, buf.Bytes())
+			if err != nil {
+				code := "bad_request"
+				var syntax *json.SyntaxError
+				if errors.As(err, &syntax) {
+					code = "bad_json"
+				}
+				c.Send(errMsg(code, err.Error()))
+				continue
+			}
 			select {
 			case in <- msg:
 			case <-c.quit:
@@ -264,6 +343,15 @@ func (c *client) readLoop() <-chan protocol.ClientMsg {
 		}
 	}()
 	return in
+}
+
+func decodeClient(format int, b []byte) (protocol.ClientMsg, error) {
+	if format == fmtBinary {
+		return wire.DecodeClient(b)
+	}
+	var msg protocol.ClientMsg
+	err := json.Unmarshal(b, &msg)
+	return msg, err
 }
 
 func errMsg(code, text string) protocol.Error {

@@ -22,6 +22,8 @@ type Metrics struct {
 	ActorPanics      prometheus.Counter
 	ConnsRejected    *prometheus.CounterVec
 	Kicked           *prometheus.CounterVec
+	WSBytes          *prometheus.CounterVec // payload bytes by dir (in/out) and format (json/binary)
+	WSFrames         *prometheus.CounterVec
 
 	tickMaxNanos atomic.Int64
 }
@@ -85,11 +87,17 @@ func New(reg prometheus.Registerer) *Metrics {
 		Kicked: prometheus.NewCounterVec(prometheus.CounterOpts{
 			Name: "sabostack_connections_kicked_total", Help: "Connections closed by the server, by reason.",
 		}, []string{"reason"}),
+		WSBytes: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Name: "sabostack_ws_bytes_total", Help: "WebSocket message payload bytes, by direction (in/out) and format (json/binary).",
+		}, []string{"dir", "format"}),
+		WSFrames: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Name: "sabostack_ws_frames_total", Help: "WebSocket messages, by direction (in/out) and format (json/binary).",
+		}, []string{"dir", "format"}),
 	}
 	tickMax := prometheus.NewGaugeFunc(prometheus.GaugeOpts{
 		Name: "sabostack_tick_duration_max_seconds", Help: "Longest single tick processed since the process started.",
 	}, func() float64 { return time.Duration(m.tickMaxNanos.Load()).Seconds() })
 	reg.MustRegister(tickMax, m.ActiveMatches, m.LiveMatches, m.ConnectedPlayers, m.TickDuration, m.Inputs,
-		m.MatchesFinished, m.SnapshotWrites, m.SnapshotBytes, m.PersistPending, m.ActorPanics, m.ConnsRejected, m.Kicked)
+		m.MatchesFinished, m.SnapshotWrites, m.SnapshotBytes, m.PersistPending, m.ActorPanics, m.ConnsRejected, m.Kicked, m.WSBytes, m.WSFrames)
 	return m
 }
