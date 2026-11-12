@@ -360,8 +360,21 @@ func (m *Matchmaker) requeueLost() {
 	now := time.Now()
 	for _, w := range ws {
 		if w.t.Gone() {
-			if n, _ := m.rdb.LRem(ctx, m.queueKey(), 1, w.raw).Result(); n > 0 {
+			// The player left. Still queued: take the ticket out. Already popped: an
+			// assignment that is recorded is delivered (deliver forgets the waiter, the
+			// match times out without them); one that can no longer arrive means the
+			// waiter is simply dropped. Either way it must not stay in m.waiting forever.
+			n, err := m.rdb.LRem(ctx, m.queueKey(), 1, w.raw).Result()
+			switch {
+			case err != nil:
+			case n > 0:
 				m.forgetTicket(w)
+			default:
+				// poppedAssigned: delivered and forgotten. Pending or unknown: look again
+				// next time, the claimer either announces or dies.
+				if m.popped(ctx, w) == poppedLost {
+					m.forgetTicket(w)
+				}
 			}
 			continue
 		}

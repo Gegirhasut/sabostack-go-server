@@ -6,6 +6,7 @@ package cluster
 import (
 	"context"
 	"log/slog"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -39,6 +40,12 @@ type Node struct {
 	adopt func() bool // false while draining: a node on its way out takes no new matches
 
 	joinSent time.Time // when Join's heartbeat was sent
+
+	// fenceMu makes "fence and stop everything" and "check not fenced, start adopted
+	// matches" atomic with respect to each other: without it, a fence landing between
+	// the adopt loop's check and mgr.Adopt left freshly adopted matches running on a node
+	// that had just given up its lease.
+	fenceMu sync.Mutex
 }
 
 // NewNode creates a Node. canAdopt may be nil (always adopt).
@@ -135,12 +142,25 @@ func (n *Node) heartbeatLoop(ctx context.Context, fenced *atomic.Bool, restore c
 		}
 		n.met.ClusterErrors.WithLabelValues("heartbeat").Inc()
 		n.log.Warn("cluster heartbeat failed", "err", err)
-		if !fenced.Load() && time.Since(lastSent) >= n.fenceAfter() {
+		switch {
+		case !fenced.Load() && time.Since(lastSent) >= n.fenceAfter():
+			n.fenceMu.Lock()
 			fenced.Store(true)
 			n.met.ClusterFenced.Set(1)
 			stopped := n.mgr.EvictAll()
+			n.fenceMu.Unlock()
 			n.log.Error("cluster lease about to lapse: stopped local matches so other nodes can adopt them",
 				"matches", stopped, "since_last_heartbeat", time.Since(lastSent).Round(time.Millisecond))
+		case fenced.Load():
+			// Still fenced: nothing may run here. A match can only have started through a
+			// path the lock does not cover (a Restore that was already under way when the
+			// lease was lost again); stop it before others adopt it.
+			n.fenceMu.Lock()
+			stopped := n.mgr.EvictAll()
+			n.fenceMu.Unlock()
+			if stopped > 0 {
+				n.log.Error("stopped matches that started while this node was fenced", "matches", stopped)
+			}
 		}
 	}
 }
@@ -174,9 +194,16 @@ func (n *Node) adoptLoop(ctx context.Context, fenced *atomic.Bool, restore <-cha
 				n.met.ClusterErrors.WithLabelValues("adopt").Inc()
 				n.log.Warn("adopting orphaned matches failed", "err", err)
 			}
-			if len(snaps) > 0 && !fenced.Load() {
-				started := n.mgr.Adopt(snaps)
-				n.log.Info("adopted matches from dead nodes", "count", started)
+			if len(snaps) > 0 {
+				// Fenced meanwhile: the matches stay ours in Redis without running; others
+				// adopt them once our lease is gone, or we restore them on renewal.
+				n.fenceMu.Lock()
+				started := 0
+				if !fenced.Load() {
+					started = n.mgr.Adopt(snaps)
+				}
+				n.fenceMu.Unlock()
+				n.log.Info("adopted matches from dead nodes", "count", started, "fetched", len(snaps))
 			}
 		}
 	}

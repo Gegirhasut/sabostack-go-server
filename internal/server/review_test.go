@@ -3,9 +3,14 @@ package server
 // Regression tests for the external code review of 2026-11-12.
 
 import (
+	"context"
 	"net/http"
 	"net/http/httptest"
+	"sync"
 	"testing"
+	"time"
+
+	"github.com/gorilla/websocket"
 
 	"github.com/Gegirhasut/sabostack-go-server/internal/protocol"
 	"github.com/Gegirhasut/sabostack-go-server/internal/store"
@@ -52,5 +57,52 @@ func TestReviewPingIsAnsweredWhileQueued(t *testing.T) {
 	pong := decode[protocol.Pong](t, c.waitFor(protocol.TypePong, nil))
 	if pong.T != 42 {
 		t.Fatalf("pong t=%d, want 42", pong.T)
+	}
+}
+
+// Second review: handleWS called conns.Add after the upgrade, so a connection upgrading
+// while Shutdown was already in conns.Wait added to a WaitGroup at zero concurrently with
+// Wait, which sync.WaitGroup forbids (the race detector reported it in TestOriginCheck
+// about once in six runs). Connections are now registered before the upgrade, under the
+// same lock Shutdown uses to close the door, and refused after it.
+func TestReviewShutdownDuringUpgrades(t *testing.T) {
+	for round := 0; round < 20; round++ {
+		ts := startServer(t, store.NewMemory())
+		stop := make(chan struct{})
+		var wg sync.WaitGroup
+		for i := 0; i < 8; i++ {
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				for {
+					select {
+					case <-stop:
+						return
+					default:
+					}
+					if ws, _, err := websocket.DefaultDialer.Dial(ts.url, nil); err == nil {
+						ws.Close()
+					}
+				}
+			}()
+		}
+		time.Sleep(5 * time.Millisecond)
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		if err := ts.srv.Shutdown(ctx); err != nil { // listener still open: upgrades keep coming
+			t.Fatalf("shutdown: %v", err)
+		}
+		cancel()
+		// After Shutdown returned, no new connection may be served.
+		ws, resp, err := websocket.DefaultDialer.Dial(ts.url, nil)
+		if err == nil {
+			ws.Close()
+			t.Fatal("a connection was upgraded after Shutdown returned")
+		}
+		if resp == nil || resp.StatusCode != http.StatusServiceUnavailable {
+			t.Fatalf("connection after shutdown: err=%v resp=%v, want 503", err, resp)
+		}
+		close(stop)
+		wg.Wait()
+		ts.stop(t)
 	}
 }

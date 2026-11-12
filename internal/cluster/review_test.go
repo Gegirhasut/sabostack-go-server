@@ -212,3 +212,86 @@ func TestReviewLiveClaimerIsNotRequeuedDeadOneIs(t *testing.T) {
 		time.Sleep(10 * time.Millisecond)
 	}
 }
+
+// Second review: a match that started on a fenced node (an adoption racing the fence, or
+// a Restore already under way when the lease was lost again) was never stopped: its writes
+// failed with plain Redis errors, not ErrNotOwner, so it ran as a zombie that players
+// reconnecting to this node could join. Fencing and adoption now exclude each other, and
+// every failed heartbeat while fenced stops whatever is running.
+func TestReviewMatchStartedWhileFencedIsStopped(t *testing.T) {
+	mr := miniredis.RunT(t)
+	rdb := redis.NewClient(&redis.Options{Addr: mr.Addr()})
+	defer rdb.Close()
+	rs := store.NewRedis(rdb, "n:", time.Hour).ForNode("a", "ws://a")
+	met := metrics.New(prometheus.NewRegistry())
+	log := slog.New(slog.NewTextHandler(io.Discard, nil))
+	mgr := match.NewManager(match.DefaultOptions(), clock.Real{}, rs, met, log)
+	defer mgr.Shutdown(context.Background())
+
+	const lease = 300 * time.Millisecond
+	hc := &hangingCluster{Cluster: rs}
+	node := NewNode(hc, mgr, met, log, Options{Lease: lease, AdoptEvery: time.Hour, AdoptBatch: 10}, nil)
+	if err := node.Join(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go node.Run(ctx)
+	if _, _, err := mgr.Create([2]string{"x", "y"}); err != nil {
+		t.Fatal(err)
+	}
+	hc.hang.Store(true)
+	eventually(t, "fenced", func() bool { return mgr.Len() == 0 })
+
+	// The race, forced: a match starts on the node after it fenced itself.
+	if _, _, err := mgr.Create([2]string{"zombie", "copy"}); err != nil {
+		t.Fatal(err)
+	}
+	deadline := time.Now().Add(2 * lease) // a couple of heartbeat intervals
+	for mgr.Len() != 0 {
+		if time.Now().After(deadline) {
+			t.Fatalf("a match started on a fenced node is still running after %s", 2*lease)
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+}
+
+func waiting(m *Matchmaker) int {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return len(m.waiting)
+}
+
+// Second review: a player whose ticket had been popped, and who then disconnected while
+// the assignment was lost, stayed in m.waiting forever (LRem found nothing, so the waiter
+// was never forgotten) and cost a Redis call every second. Leaked for good.
+func TestReviewGoneTicketAfterPopIsForgotten(t *testing.T) {
+	shortRequeue(t)
+	e := newEnv(t)
+	n1 := e.node(t, "n1")
+
+	// Assignment lost for good: the popping node died before recording it.
+	ctxLost, leaveLost := context.WithCancel(context.Background())
+	n1.JoinContext(ctxLost, "lost")
+	popAsRemote(t, e, "dead-node")
+	leaveLost()
+
+	// Assignment recorded but its message lost: delivered (and forgotten) on the way out.
+	e.mr.Set("t:alive:n2", "ws://n2")
+	ctxRec, leaveRec := context.WithCancel(context.Background())
+	n1.JoinContext(ctxRec, "recorded")
+	id := popAsRemote(t, e, "n2")
+	e.mr.Set("t:mm:assign:"+id, `{"ticket":"`+id+`","matchId":"n2-m1","seat":0,"token":"tok","opponent":"x","url":"ws://n2"}`)
+	leaveRec()
+
+	deadline := time.Now().Add(20 * checkLostEvery)
+	for waiting(n1) != 0 {
+		if time.Now().After(deadline) {
+			t.Fatalf("%d waiter(s) of disconnected players still tracked", waiting(n1))
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	if n := queueLen(e); n != 0 {
+		t.Fatalf("a disconnected player's ticket was requeued (queue length %d)", n)
+	}
+}

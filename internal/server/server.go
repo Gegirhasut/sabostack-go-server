@@ -100,7 +100,13 @@ type Server struct {
 	origins  map[string]bool
 	limits   connLimits
 
+	// conns counts connection handlers. A handler registers (track) before its upgrade,
+	// under connMu, and Shutdown sets closing under the same lock before it waits: so no
+	// Add can race with Wait (which sync.WaitGroup forbids), and no connection is served
+	// after Shutdown. http.Server.Shutdown does not wait for hijacked connections.
 	conns    sync.WaitGroup
+	connMu   sync.Mutex
+	closing  bool
 	open     atomic.Int64
 	ipMu     sync.Mutex
 	perIP    map[string]int
@@ -232,6 +238,9 @@ func (s *Server) UseMatchmaker(mm Matchmaker) { s.queue = mm }
 // has stopped accepting new connections.
 func (s *Server) Shutdown(ctx context.Context) error {
 	s.Drain()
+	s.connMu.Lock()
+	s.closing = true
+	s.connMu.Unlock()
 	err := s.mgr.Shutdown(ctx)
 	done := make(chan struct{})
 	go func() { s.conns.Wait(); close(done) }()
@@ -249,6 +258,17 @@ func (s *Server) Shutdown(ctx context.Context) error {
 // request from, so only the last TrustedProxies entries were written by our proxies;
 // everything to the left of them came from the client and is free to forge. (Taking the
 // first entry, as before, let a client pick any IP it liked and bypass -max-conns-per-ip.)
+// track registers a connection handler, or reports false once Shutdown has begun.
+func (s *Server) track() bool {
+	s.connMu.Lock()
+	defer s.connMu.Unlock()
+	if s.closing {
+		return false
+	}
+	s.conns.Add(1)
+	return true
+}
+
 func (s *Server) clientIP(r *http.Request) string {
 	if n := s.cfg.TrustedProxies; n > 0 {
 		var hops []string
@@ -307,13 +327,17 @@ func (s *Server) handleWS(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	defer release()
+	if !s.track() {
+		s.metrics.ConnsRejected.WithLabelValues("shutting_down").Inc()
+		http.Error(w, "server is shutting down", http.StatusServiceUnavailable)
+		return
+	}
+	defer s.conns.Done()
 	ws, err := s.upgrader.Upgrade(w, r, nil)
 	if err != nil {
 		s.metrics.ConnsRejected.WithLabelValues("upgrade").Inc()
 		return // Upgrade already replied with an HTTP error
 	}
-	s.conns.Add(1)
-	defer s.conns.Done()
 	s.metrics.ConnectedPlayers.Inc()
 	defer s.metrics.ConnectedPlayers.Dec()
 
