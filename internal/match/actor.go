@@ -15,8 +15,10 @@ import (
 // ErrStopped is returned when talking to an actor whose goroutine has exited.
 var ErrStopped = errors.New("match: actor stopped")
 
-// inputQueueSize bounds the inputs buffered per seat. Each seat has its own queue, so a
-// player who floods the server only ever drops their own inputs, never the opponent's.
+// inputQueueSize bounds the inputs buffered per seat. The limit is per seat, so a player
+// who floods the server only ever drops their own inputs, never the opponent's. The
+// connection rate limit (burst 20) keeps a real client far below it; the headroom is for
+// bursts that bypass the limiter (tests, a stalled actor catching up).
 const inputQueueSize = 128
 
 // forceSnapshotEvery: a match whose state did not change is still re-snapshotted every
@@ -24,8 +26,59 @@ const inputQueueSize = 128
 const forceSnapshotEvery = 10
 
 type inputCmd struct {
-	seq uint64
-	act game.Action
+	seq  uint64
+	act  uint8 // index into actions; a string here would make every queued input 24 B
+	seat uint8
+}
+
+// inputQueue holds both seats' pending inputs in arrival order (so neither seat is
+// favoured when both act at once) with a separate cap per seat. It is a slice, not a
+// channel: a buffered channel allocates all its slots up front, which for thousands of
+// mostly idle matches was the largest heap item; this grows only while inputs are queued.
+type inputQueue struct {
+	mu  sync.Mutex
+	buf []inputCmd
+	n   [2]int
+}
+
+func (q *inputQueue) push(in inputCmd) bool {
+	q.mu.Lock()
+	defer q.mu.Unlock()
+	if q.n[in.seat] >= inputQueueSize {
+		return false
+	}
+	q.n[in.seat]++
+	q.buf = append(q.buf, in)
+	return true
+}
+
+// take returns everything queued and installs spare (emptied) as the new buffer.
+func (q *inputQueue) take(spare []inputCmd) []inputCmd {
+	q.mu.Lock()
+	defer q.mu.Unlock()
+	b := q.buf
+	q.buf, q.n = spare[:0], [2]int{}
+	return b
+}
+
+var actions = [...]game.Action{game.Left, game.Right, game.Rotate, game.SoftDrop, game.HardDrop}
+
+const badAction = uint8(len(actions))
+
+func actionCode(a game.Action) uint8 {
+	for i, x := range actions {
+		if x == a {
+			return uint8(i)
+		}
+	}
+	return badAction
+}
+
+func (in inputCmd) action() game.Action {
+	if in.act < badAction {
+		return actions[in.act]
+	}
+	return "" // invalid: Match.Input reports it
 }
 
 // Actor runs one Match in its own goroutine. The goroutine is the only code that ever
@@ -33,12 +86,14 @@ type inputCmd struct {
 // per-seat queues). That is the whole concurrency story: no mutexes around game state,
 // and simultaneous inputs from both players are simply serialised in arrival order.
 type Actor struct {
-	id     string
-	m      *Match
-	mgr    *Manager
-	log    *slog.Logger
-	cmds   chan func(now time.Time)
-	inputs [2]chan inputCmd
+	id    string
+	m     *Match
+	mgr   *Manager
+	log   *slog.Logger
+	cmds  chan func(now time.Time)
+	inq   inputQueue
+	wake  chan struct{} // an input was queued
+	spare []inputCmd    // recycled input buffer (actor goroutine only)
 
 	stop        chan struct{} // closed by Stop: snapshot and exit
 	stopOnce    sync.Once
@@ -56,7 +111,7 @@ func newActor(m *Match, mgr *Manager) *Actor {
 		id: m.ID, m: m, mgr: mgr,
 		log:     mgr.log.With("match", m.ID),
 		cmds:    make(chan func(time.Time), 64),
-		inputs:  [2]chan inputCmd{make(chan inputCmd, inputQueueSize), make(chan inputCmd, inputQueueSize)},
+		wake:    make(chan struct{}, 1),
 		stop:    make(chan struct{}),
 		evicted: make(chan struct{}),
 		done:    make(chan struct{}),
@@ -102,10 +157,8 @@ func (a *Actor) run() {
 			a.drainInputs(now) // inputs sent before a command (e.g. Detach) apply before it
 			f(now)
 			a.observe(now)
-		case in := <-a.inputs[0]:
-			a.input(0, in, clk.Now())
-		case in := <-a.inputs[1]:
-			a.input(1, in, clk.Now())
+		case <-a.wake:
+			a.drainInputs(clk.Now())
 		case <-ticker.C():
 			start := time.Now() // real time: this measures CPU cost, not game time
 			now := clk.Now()
@@ -160,22 +213,19 @@ func (a *Actor) observe(now time.Time) {
 }
 
 func (a *Actor) drainInputs(now time.Time) {
-	for {
-		select {
-		case in := <-a.inputs[0]:
-			a.input(0, in, now)
-		case in := <-a.inputs[1]:
-			a.input(1, in, now)
-		default:
-			return
-		}
+	b := a.inq.take(a.spare)
+	for _, in := range b {
+		r := a.m.Input(int(in.seat), in.seq, in.action(), now)
+		a.mgr.inputCounters[r].Inc()
 	}
-}
-
-func (a *Actor) input(seat int, in inputCmd, now time.Time) {
-	r := a.m.Input(seat, in.seq, in.act, now)
-	a.mgr.inputCounters[r].Inc()
-	a.observe(now)
+	if len(b) > 0 {
+		a.observe(now)
+	}
+	if cap(b) <= 64 { // keep a small buffer for reuse; let a burst-sized one go
+		a.spare = b[:0]
+	} else {
+		a.spare = nil
+	}
 }
 
 // crashed runs on the actor goroutine after a panic. The match state may be corrupt, so it
@@ -261,10 +311,13 @@ func (a *Actor) Input(seat int, seq uint64, act game.Action) {
 	if seat < 0 || seat > 1 {
 		return
 	}
-	select {
-	case a.inputs[seat] <- inputCmd{seq, act}:
-	default:
+	if !a.inq.push(inputCmd{seq: seq, act: actionCode(act), seat: uint8(seat)}) {
 		a.mgr.overflowCounter.Inc()
+		return
+	}
+	select {
+	case a.wake <- struct{}{}:
+	default: // a wake-up is already pending; it will drain this input too
 	}
 }
 

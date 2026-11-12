@@ -2,3 +2,8 @@
 *.exe
 *.test
 *.out
+
+# local tool configuration
+CLAUD?.md
+.claud[e]/
+AGENTS.md

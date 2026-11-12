@@ -1,88 +1,155 @@
-# Hardening for high load
+# Устойчивость под нагрузкой
 
-Changes made after the code review of the reference server. Every item has a test
-(`internal/*/hardening_test.go`, `internal/store/redis_node_test.go`,
-`internal/lobby/liveness_test.go`). All tests pass with `-race`.
+Первая версия сервера была рассчитана на один узел и честных клиентов. Здесь описано, что
+в ней было не так с точки зрения высокой нагрузки, злонамеренных клиентов и эксплуатации, и
+как это исправлено. У каждого бага есть тест, который его воспроизводит. Эти тесты
+написаны только на API, существовавшем до исправления, поэтому их можно запустить против
+старого кода и увидеть, что они падают (результаты ниже).
 
-## Gameplay and protocol fixes
+## Баги и их воспроизведение
 
-| Problem | Fix |
+Тесты лежат в `internal/match/regression_test.go` и `internal/server/regression_test.go`.
+Колонка «до» — реальный вывод теста, запущенного против кода до исправлений (коммит
+`8c22a70`).
+
+| Тест | Баг | До исправления | После |
+|---|---|---|---|
+| `TestBugResumeEventArrivesBeforeSnapshot` | `player_back` приходит раньше снапшота и дублируется | FAIL: «resuming client got 2 messages, want only the snapshot» | PASS |
+| `TestBugEndlessPauseByReconnecting` | бесконечная пауза через переподключения | FAIL: «after 3m13s of pausing: phase=playing (match frozen indefinitely)» | PASS |
+| `TestBugBothIdleSeatZeroLoses` | при обоюдном бездействии проигрывает место 0 | FAIL: «winner=1 reason=opponent_idle, want no winner» | PASS |
+| `TestBugSnapshotCarriesWholeEventLog` | снапшот тащит весь журнал событий | FAIL: «snapshot holds 64 events (4720 bytes)» | PASS |
+| `TestBugActorPanicKillsProcess` | паника в одном матче роняет процесс | FAIL: `panic: boom`, тестовый бинарник убит | PASS |
+| `TestBugFloodStarvesOpponentInputs` | флудер вытесняет входы соперника | FAIL: «victim's inputs applied up to seq 0 of 10» | PASS |
+| `TestBugTopOutPhaseChangeNotPersisted` | конец раунда из `Input` не снимается снапшотом | FAIL: «timed out waiting for round_end snapshot» | PASS |
+| `TestBugSlowStoreDropsNewestSnapshot` | при медленном хранилище теряется самый свежий снапшот | FAIL: «1025 writes, last = "old": the newest snapshot was lost» | PASS |
+| `TestBugDeadStoreIsHammered` | мёртвое хранилище долбится каждой записью | FAIL: «dead store called 20 times for 20 writes» | PASS |
+| `TestBugShutdownHangsOnStuckStore` | остановка висит на зависшем хранилище | FAIL: «Shutdown ignored its 300 ms context and was still waiting after 3 s» | PASS |
+| `TestBugInputFloodNotRateLimited` | нет ограничения частоты входов (спидхак) | FAIL: «timed out waiting for error» — 20 000 входов приняты | PASS |
+| `TestBugBadFieldTypeClosesConnection` | поле неверного типа рвёт соединение | FAIL: «connection closed while waiting for error» | PASS |
+| `TestBugNameValidationByBytes` | длина имени в байтах, управляющие символы проходят | FAIL: 13-буквенное кириллическое имя отклонено | PASS |
+
+Как повторить проверку на старом коде:
+
+```sh
+git worktree add /tmp/before 8c22a70
+cp internal/match/regression_test.go /tmp/before/internal/match/
+cp internal/server/regression_test.go /tmp/before/internal/server/
+cd /tmp/before
+# по одному: TestBugActorPanicKillsProcess на старом коде убивает весь тестовый бинарник
+for t in $(grep -ho '^func TestBug[A-Za-z]*' internal/*/regression_test.go | cut -d' ' -f2); do
+  go test -count=1 -timeout 60s -run "^$t\$" ./internal/match/ ./internal/server/ >/dev/null 2>&1 && echo "PASS $t" || echo "FAIL $t"
+done
+```
+
+## Что изменилось
+
+### Игровая логика и протокол
+
+| Проблема | Решение |
 |---|---|
-| On resume, `player_back` reached the client **before** its snapshot, and again inside it. | `Match.Attach` attaches the new sink only after the snapshot is sent. The snapshot is always the first message. |
-| A losing player could freeze a match forever by reconnecting just before `ReconnectGrace` expired (measured: 15 s of real time cost 0.25 s of round time). | `PauseBudget` (default 45 s, flag `-pause-budget`): each player's total time away while the match is paused. When it runs out, that player forfeits (`opponent_disconnected`). It is persisted in snapshots (`awayUsed`). |
-| A client could send thousands of inputs per second, and all of them applied (measured: 42k in 5.5 s). | A token bucket on every connection (`-input-rate 40`, `-input-burst 20`). Inputs over the limit are dropped and counted as `inputs_total{result="rate_limited"}`. A client that keeps flooding is disconnected with error `rate_limited`. |
-| Both players shared one actor command queue, so a flooder could crowd out the opponent's inputs. | Each seat has its own input queue (128). Overflow only drops the sender's own inputs. Commands (Attach, Detach) first drain the inputs queued before them, so ordering is preserved. |
-| Both players idle meant seat 0 lost. | Both idle ends the match with no winner (`both_idle`). |
-| A top-out inside `Input` was only noticed (logged, snapshotted) on the next tick. | The actor checks for a phase change after every step. |
+| При `resume` событие `player_back` приходило **раньше** снапшота и потом ещё раз внутри него. | `Match.Attach` подключает новый sink только после отправки снапшота. Снапшот всегда первое сообщение. |
+| Проигрывающий мог бесконечно держать матч на паузе: отключиться и вернуться перед концом окна переподключения, и так по кругу. Вживую 15 с реального времени съели 0,25 с раунда. | **Бюджет паузы** `PauseBudget` (по умолчанию 45 с, флаг `-pause-budget`): суммарное время отсутствия игрока, пока матч на паузе. Когда бюджет кончился, игрок получает техническое поражение (`opponent_disconnected`). Бюджет хранится в снапшоте (`awayUsed`) и переживает перезапуск. |
+| Частота сообщений клиента ничем не ограничивалась. Вживую один клиент отправил 42 тыс. входов за 5,5 с, и все они применились, то есть получился спидхак. | Token bucket на каждом подключении (`-input-rate 40`, `-input-burst 20`). Сверх лимита входы отбрасываются (`inputs_total{result="rate_limited"}`), а клиент, который продолжает флудить, отключается с ошибкой `rate_limited`. |
+| Входы обоих игроков шли в одну очередь актора, и флудер вытеснял входы соперника. | У каждого места своя очередь входов (128). Переполнение отбрасывает только входы отправителя. Перед командой (`Attach`, `Detach`) актор дочищает очереди входов, так что порядок сохраняется. |
+| Если бездействовали оба, проигрывало место 0. | Ничья без победителя, причина `both_idle`. |
+| Конец раунда внутри `Input` (переполнение поля) замечался только на следующем тике: не логировался и не снимался снапшот. | Актор проверяет смену фазы после каждого шага. |
+| Поле неверного типа (`"seq":"x"`) закрывало соединение. | Ответ `bad_request`, соединение остаётся. |
+| Длина имени считалась в байтах, управляющие символы пропускались. | От 1 до 24 печатаемых символов (рун). |
 
-## Resilience
+### Надёжность
 
-| Problem | Fix |
+| Проблема | Решение |
 |---|---|
-| One panic in one match killed the process and every match on it. | `Actor.run` recovers. The match is aborted (`match_over`, reason `internal_error`), its clients are closed, and its snapshot is deleted so a restart does not crash on it again. Counted in `sabostack_actor_panics_total`. |
-| A single snapshot writer, one round trip per write. Snapshots were dropped when it fell behind. | `PersistWorkers` shards (default 4, `-persist-workers`), each pinned to a set of matches, so writes for one match keep their order. Pending writes are **coalesced**: a newer snapshot replaces an unsent one (`snapshot_writes{result="superseded"}`), so nothing is dropped blindly. Batches of up to 64 writes go to Redis in one pipeline. |
-| Snapshots carried the whole 256-event log (most of their size) every second. | Snapshots keep only the newest `SnapshotEvents` (32). A match whose state did not change is not re-snapshotted, except a forced refresh every 10 intervals. Size is exported as `sabostack_snapshot_bytes`. |
-| With Redis down, match end blocked the match goroutine, and shutdown stopped matches one by one with no time limit. | The delete at match end is asynchronous (the TTL is the safety net). A circuit breaker skips writes for 5 s after 5 failed batches in a row. `Shutdown` stops all actors at once and never waits past its context. |
-| Two servers on one Redis would each restore *all* matches (split brain). | Node mode: `-node-id` (and `-public-url`). Each match has an owner key, and saves and deletes are Lua scripts that refuse a match owned by another node (`ErrNotOwner`). A node that gets `ErrNotOwner` stops driving that match. Each node restores only its own set. Without `-node-id` the old single-node layout is used (with a warning). Single Redis or Sentinel only, not Redis Cluster. |
-| A `resume` that reached the wrong node got `match_not_found`. | The node asks the store's directory, and replies `{"type":"error","code":"wrong_server","url":"wss://…"}` so the client can reconnect to the owning node. |
+| Паника в одном матче роняла процесс со всеми матчами. | `Actor.run` перехватывает панику. Матч прерывается (`match_over`, причина `internal_error`), клиенты отключаются, снапшот удаляется, чтобы перезапуск не упал на нём снова. Метрика `sabostack_actor_panics_total`. |
+| Снапшоты писала одна goroutine, по одной операции за раз. Отстав, она молча выбрасывала **новые** снапшоты, а это ровно те, которые терять нельзя. | Несколько персистеров (`-persist-workers`, по умолчанию 4), матч всегда попадает в один и тот же, поэтому порядок записей матча сохраняется. Ожидающая запись **схлопывается**: более новый снапшот заменяет ещё не записанный (`snapshot_writes{result="superseded"}`). До 64 записей уходят в Redis одним pipeline. |
+| Каждый снапшот раз в секунду тащил весь журнал событий (до 256), а это основная часть его размера. | В снапшоте только последние 32 события. Неизменившийся матч не переписывается, кроме обновления раз в 10 интервалов. Размер виден в `sabostack_snapshot_bytes`. |
+| Если Redis лежит, каждая запись всё равно шла в него и ждала ошибки или таймаута. Конец матча блокировал его goroutine. Остановка ждала финальные снапшоты без ограничения по времени. | Circuit breaker: после 5 неудачных пакетов подряд записи 5 с пропускаются. Удаление в конце матча асинхронное, страховка — TTL. `Shutdown` останавливает все матчи разом и не ждёт дольше своего контекста. |
+| Два сервера на одном Redis при старте восстановили бы **все** матчи, получился бы split brain. | **Режим узлов** (`-node-id`, `-public-url`). У матча есть ключ владельца. Сохранение и удаление идут Lua-скриптами, которые отказывают, если матч принадлежит другому узлу (`ErrNotOwner`). Узел, получивший `ErrNotOwner`, перестаёт вести матч. Каждый узел восстанавливает только своё. Без `-node-id` остаётся прежняя схема одного узла (с предупреждением в логе). Поддерживается один Redis или Sentinel, но не Redis Cluster. |
+| `resume`, попавший не на тот узел, получал `match_not_found`. | Узел смотрит в каталог хранилища и отвечает `{"type":"error","code":"wrong_server","url":"wss://…"}`, и клиент переподключается к владельцу. |
 
-## Transport and ops
+### Транспорт и эксплуатация
 
-| Problem | Fix |
+| Проблема | Решение |
 |---|---|
-| A slow client was disconnected after 128 queued messages, including state frames that are superseded anyway. | `state` messages are conflated: only the newest unsent one is kept. Events, snapshots and errors are never dropped; 128 of *those* still means slow consumer. |
-| `/metrics` on the public port, no pprof. | `-admin-addr` serves `/metrics`, `/healthz`, `/readyz` and `/debug/pprof/` on a private address. `-public-metrics` (default true) keeps `/metrics` on the public port, which the load bot uses. |
-| No readiness or draining for rolling deploys. | `/readyz` returns 503 while draining. `-drain-timeout`: on SIGTERM, stop matchmaking (queued players get `unavailable`), let live matches finish, then snapshot the rest. Resumes keep working while draining. A second signal kills the process. |
-| Any Origin accepted. No connection limits. | `-allowed-origins` (no Origin header, e.g. native apps, is always accepted), `-max-conns`, `-max-conns-per-ip`, `-trust-proxy` (client IP from `X-Forwarded-For`). The limits are off by default, so local load tests from one IP keep working. |
-| Names were measured in bytes, and control characters were allowed. | 1–24 printable runes. |
-| Bad field types (`"seq":"x"`) closed the connection. | They get `bad_request`; the connection stays open. |
-| Matchmaking could pair a player with an opponent whose socket had already died. | `lobby.JoinContext` skips waiting tickets whose connection context is done. `Leave` is O(1) (a linked list). |
-| Disconnects had no reason in metrics. | `sabostack_connections_kicked_total{reason}`: `slow_consumer`, `write_failed`, `ping_failed`, `pong_timeout`, `rate_limit`. Also `sabostack_connections_rejected_total{reason}` and `sabostack_persist_pending`. |
+| Медленного клиента отключали после 128 сообщений в очереди, хотя большинство из них — кадры `state`, которые всё равно устаревают. | Кадры `state` схлопываются: в очереди только последний неотправленный. События, снапшоты и ошибки не теряются никогда, и только 128 таких сообщений означают медленного клиента. |
+| `/metrics` на публичном порту, профилировщика нет. | `-admin-addr` отдаёт `/metrics`, `/healthz`, `/readyz` и `/debug/pprof/` на внутреннем адресе. `-public-metrics` (по умолчанию true) оставляет `/metrics` и на публичном порту, им пользуется бот. |
+| Нет readiness и плавного вывода узла при выкатке. | `/readyz` отвечает 503 во время draining. `-drain-timeout`: по SIGTERM узел перестаёт матчить (игроки в очереди получают `unavailable`), даёт идущим матчам доиграть, потом снимает снапшоты оставшихся. `resume` во время draining работает. Второй сигнал убивает процесс. |
+| Принимался любой Origin, лимитов подключений не было. | `-allowed-origins` (запрос без Origin, например из нативного приложения, принимается всегда), `-max-conns`, `-max-conns-per-ip`, `-trust-proxy` (IP из `X-Forwarded-For`). Лимиты по умолчанию выключены, чтобы локальные нагрузочные тесты с одного IP работали. |
+| Матчмейкинг мог свести игрока с соперником, чей сокет уже умер. | `lobby.JoinContext` пропускает заявки с завершённым контекстом подключения. `Leave` за O(1) (связный список). |
+| Причины отключений не было видно. | `sabostack_connections_kicked_total{reason}`: `slow_consumer`, `write_failed`, `ping_failed`, `pong_timeout`, `rate_limit`. Плюс `sabostack_connections_rejected_total{reason}` и `sabostack_persist_pending`. |
 
-## Heartbeat: why the defaults stayed at 20 s / 30 s
+### Память: что показал профиль
 
-A silently dropped mobile connection counts as connected for up to `PongWait`. The match
-is not paused in that window, and with `PongWait` (30 s) equal to `IdleTimeout` (30 s) the
-player can lose on idle before the drop is noticed. A 3 s ping and 10 s pong-wait were
-tried. On a heavily loaded host (server plus 1,200 bots on one laptop) they disconnected
-**live** clients that were only slow to read: 187 drops versus 0 with the old timings. So
-the defaults keep the original values, and the timings are flags (`-ping-interval`,
-`-pong-wait`).
+Первое сравнение под нагрузкой показало, что новая версия занимает **на 10 % больше RSS**
+(397 против 356 МБ на 2000 парах). Heap-профиль (`/debug/pprof/heap` на обеих версиях
+под одинаковой нагрузкой) указал на две причины:
 
-How to choose:
+| Аллокация | до | первая версия исправлений | итог |
+|---|---:|---:|---:|
+| `match.newActor` | 10,0 МБ | 24,1 МБ | **3,5 МБ** |
+| `websocket.newConn` (cum) | 1,5 МБ | 9,0 МБ | 1,5 МБ |
+| `server.newClient` | 10,0 МБ | 3,5 МБ | 3,5 МБ |
 
-- **Lower bound:** p99 of the silence of a *live* client: RTT, packet loss, app freezes,
-  background-tab throttling (a background browser tab can stall timers for a minute).
-  Measure it on real phones before tightening.
-- **Upper bound:** keep `PongWait` below `IdleTimeout`. Otherwise a silent drop is judged
-  as AFK.
-- **Trade-off:** lower means faster pause on a real drop but more false drops (each one is
-  a reconnect, a pause for the opponent, and budget spent). Higher means fewer false
-  drops, but a vanished player keeps "playing" unpaused for longer.
+- **Очереди входов.** Две буферизованные очереди по 128 элементов на матч аллоцируют все
+  слоты сразу, а тысячи матчей почти всё время держат их пустыми. Теперь очередь — срез
+  под mutex, который растёт только на время всплеска. Входы обоих игроков лежат в одной
+  очереди в порядке прихода, чтобы ни одно место не получало преимущества при
+  одновременных действиях, а лимит в 128 считается отдельно для каждого места. Действие
+  кодируется байтом, поэтому элемент занимает 16 байт, а не 24.
+- **`WriteBufferPool`** в upgrader был добавлен, чтобы сэкономить память, а на деле
+  добавил около 8 МБ на 4000 подключений. Без него gorilla переиспользует 4-килобайтные
+  буферы, которые net/http уже выделил под подключение. Настройки буферов возвращены по
+  умолчанию.
+- **Outbox клиента** на срезах вместо канала на 128 `any` стал в 3 раза меньше.
 
-## Load comparison (one Windows laptop, server and bots on the same 16 threads)
+Итог на 2000 парах: средний RSS **333 МБ против 355 МБ** у версии до исправлений (−6 %).
 
-`cmd/bot -pairs N -rate 10`, server `-countdown 1s`, in-memory store.
+## Heartbeat: почему по умолчанию 20 с / 30 с
 
-| | before | after |
-|---|---|---|
-| 300 pairs: matches / errors | 300 / 0 | 300 / 0 |
-| 450 pairs: matches / errors / drops | 441 / 18 / 0 | **450 / 0 / 0** |
-| 450 pairs: input→ack p50 / p95 / p99 | 219 / 2283 / 3260 ms | **167 / 1283 / 1844 ms** |
-| 450 pairs: mean tick | 2575 µs | **535 µs** |
-| 600 pairs | the laptop is saturated for both versions (hundreds of refused TCP connects) | same |
+Молча пропавшее мобильное соединение (сменилась сеть, приложение уснуло) считается живым до
+`PongWait`. Всё это время матч не на паузе. Если `PongWait` не меньше `IdleTimeout`,
+пропавший игрок может проиграть по бездействию раньше, чем сервер заметит обрыв.
 
-Absolute latencies are high because native Windows plus 900–1,200 bot goroutines on the
-same CPU is not a server. Compare the columns, not the numbers.
+Пробовал ping раз в 3 с и `PongWait` 10 с. На перегруженной машине (сервер и 1200 ботов на
+одном ноутбуке) это рвало **живых** клиентов, которые просто медленно читали сокет: 187
+обрывов против 0 со старыми значениями. Поэтому по умолчанию остались прежние значения, а
+тайминги вынесены во флаги `-ping-interval` и `-pong-wait`.
 
-## Not done here (decisions or bigger projects)
+Как выбирать значение:
 
-- **Cross-node matchmaking.** The queue is still per process. Pairing players who
-  connected to different nodes needs a shared matchmaker that allocates the match to one
-  node, which can then redirect players with `wrong_server`.
-- **Takeover of a dead node's matches.** Ownership expires with the snapshot TTL. Fast
-  takeover needs a short lease that is renewed while the node is alive.
-- **Bandwidth.** A `state` message is about 0.9 KB and carries both full boards, which
-  works out to about 10 KB/s per client. Deltas and a binary encoding need client changes.
-- **Sharded tick loops** instead of one ticker per match, if profiling ever shows
-  timer overhead.
+- **Нижняя граница:** p99 «тишины» *живого* клиента. Это RTT, потери пакетов, фризы
+  приложения и троттлинг фоновых вкладок (браузер может задерживать таймеры фоновой вкладки
+  до минуты). Её нужно измерить на реальных телефонах, прежде чем ужесточать.
+- **Верхняя граница:** `PongWait` меньше `IdleTimeout`, иначе молчаливый обрыв засчитывается
+  как бездействие.
+- **Компромисс:** меньше значение — быстрее пауза при настоящем обрыве, но больше ложных
+  обрывов. Каждый ложный обрыв — это переподключение, пауза у соперника и трата бюджета
+  паузы. Больше значение — меньше ложных обрывов, но пропавший игрок дольше «играет» без
+  паузы.
+
+## Сравнение под нагрузкой
+
+Обе версии прогнаны на одном стенде по методике [LOAD_TESTING.md](LOAD_TESTING.md), на
+каждой ступени подряд, на 2000 и 3000 парах по три раза (в таблице медианы). Таблица
+целиком и разбор — в [LOAD_TESTING.md](LOAD_TESTING.md#сравнение-до-и-после-укрепления),
+сырые данные — в [`docs/loadtest/hardening/`](loadtest/hardening/).
+
+| Пар | p95, мс (до → после) | CPU, % ядра | RSS, МБ | Ошибок / обрывов |
+|---:|---:|---:|---:|---:|
+| 500 | 48,4 → 48,4 | 92 → 92 | 111 → 106 | 0 / 0 → 0 / 0 |
+| 1000 | 48,5 → 48,4 | 154 → 150 | 198 → 187 | 0 / 0 → 0 / 0 |
+| 2000 | 51,6 → 61,7 | 253 → 255 | 361 → 339 | 0 / 0 → 0 / 0 |
+| 3000 | 120,7 → 96,0 | 328 → 330 | 515 → 479 | 0 / 0 → 0 / 0 |
+
+Защиты ничего не стоят по CPU, памяти стало меньше. Задержка на 2000+ парах в пределах
+разброса между прогонами одной версии: на этом стенде он больше разницы между версиями.
+
+## Что не сделано
+
+- **Общий матчмейкинг между узлами.** Очередь по-прежнему своя у каждого процесса. Чтобы
+  свести игроков, подключённых к разным узлам, нужна общая очередь, которая назначает матч на
+  один узел. Остальные игроки потом переходят туда через `wrong_server`.
+- **Перехват матчей умершего узла.** Владение истекает вместе с TTL снапшота. Для быстрого
+  перехвата нужна короткая аренда, которую живой узел продлевает.
+- **Трафик.** Кадр `state` весит около 0,9 КБ и несёт оба поля целиком. У бота с 10
+  входами в секунду это 3,7 КБ/с на клиента, на 4000 подключениях около 15 МБ/с.

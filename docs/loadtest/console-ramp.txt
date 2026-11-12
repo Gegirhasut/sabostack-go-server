@@ -1,0 +1,143 @@
+=== step 0 pairs, host free before: 6.38 GB ===
+bots:               0 (0 pairs)
+ramp / measured:    0.0s / 60.0s
+matches finished:   0
+errors / dropped:   0 / 0
+inputs sent:        0
+messages received:  0 (0/s, 0.0 MB)
+input->ack latency: p50=0.0ms p95=0.0ms p99=0.0ms max=0.0ms (n=0)
+server connections: avg 0, min 0; live matches avg 0 (0 incl. lingering)
+server CPU:         0.3% of one core
+server RSS:         avg 21.0 MB, max 22.5 MB (start 18.9, end 22.5)
+server goroutines:  avg 10 (start 10, end 15)
+server tick:        mean 0.0µs, max 0.00ms
+bot exit: 0
+bot_max_rss_kb=10752 bot_cpu_user_s=0.02 bot_cpu_sys_s=0.08
+bot stderr lines (errors): 0
+server_peak_VmHWM:	   22972 kB
+server exit code: 0, shutdown took .013902781s
+server_error_log_lines=0
+Mem:            7942        1414        1390         172        5501        6528
+=== step 100 pairs, host free before: 6.57 GB ===
+bots:               200 (100 pairs)
+ramp / measured:    0.3s / 60.0s
+matches finished:   327
+errors / dropped:   0 / 0
+inputs sent:        28196
+messages received:  53782 (896/s, 44.3 MB)
+input->ack latency: p50=26.3ms p95=48.3ms p99=50.4ms max=52.1ms (n=28175)
+server connections: avg 200, min 200; live matches avg 100 (151 incl. lingering)
+server CPU:         38.0% of one core
+server RSS:         avg 37.1 MB, max 40.1 MB (start 34.4, end 38.6)
+server goroutines:  avg 761 (start 731, end 752)
+server tick:        mean 3.1µs, max 1.79ms
+bot exit: 0
+bot_max_rss_kb=20388 bot_cpu_user_s=8.23 bot_cpu_sys_s=11.68
+bot stderr lines (errors): 0
+server_peak_VmHWM:	   39192 kB
+server exit code: 0, shutdown took .021448959s
+server_error_log_lines=0
+Mem:            7942        1415        1389         172        5501        6526
+=== step 250 pairs, host free before: 7.38 GB ===
+bots:               500 (250 pairs)
+ramp / measured:    0.7s / 60.0s
+matches finished:   811
+errors / dropped:   0 / 0
+inputs sent:        71379
+messages received:  134617 (2244/s, 111.0 MB)
+input->ack latency: p50=25.2ms p95=48.4ms p99=50.5ms max=63.4ms (n=71341)
+server connections: avg 500, min 499; live matches avg 250 (378 incl. lingering)
+server CPU:         67.6% of one core
+server RSS:         avg 64.6 MB, max 67.9 MB (start 60.3, end 65.8)
+server goroutines:  avg 1888 (start 1802, end 1870)
+server tick:        mean 3.1µs, max 5.99ms
+bot exit: 0
+bot_max_rss_kb=36760 bot_cpu_user_s=16.77 bot_cpu_sys_s=21.15
+bot stderr lines (errors): 0
+server_peak_VmHWM:	   66552 kB
+server exit code: 0, shutdown took .038224721s
+server_error_log_lines=0
+Mem:            7942        1417        1387         172        5501        6525
+=== step 500 pairs, host free before: 6.84 GB ===
+bots:               1000 (500 pairs)
+ramp / measured:    1.3s / 60.0s
+matches finished:   1589
+errors / dropped:   0 / 0
+inputs sent:        143946
+messages received:  269443 (4491/s, 222.4 MB)
+input->ack latency: p50=26.1ms p95=48.5ms p99=50.8ms max=89.1ms (n=143835)
+server connections: avg 1000, min 996; live matches avg 500 (756 incl. lingering)
+server CPU:         107.0% of one core
+server RSS:         avg 111.3 MB, max 114.7 MB (start 95.5, end 113.1)
+server goroutines:  avg 3766 (start 3690, end 3717)
+server tick:        mean 5.2µs, max 19.60ms
+bot exit: 0
+bot_max_rss_kb=61356 bot_cpu_user_s=29.52 bot_cpu_sys_s=33.13
+bot stderr lines (errors): 0
+server_peak_VmHWM:	  111972 kB
+server exit code: 0, shutdown took .057958882s
+server_error_log_lines=0
+Mem:            7942        1414        1390         172        5502        6528
+=== step 1000 pairs, host free before: 6.55 GB ===
+bots:               2000 (1000 pairs)
+ramp / measured:    2.7s / 60.0s
+matches finished:   3010
+errors / dropped:   0 / 0
+inputs sent:        293691
+messages received:  546687 (9111/s, 453.3 MB)
+input->ack latency: p50=26.2ms p95=48.8ms p99=53.6ms max=143.8ms (n=293490)
+server connections: avg 2000, min 1998; live matches avg 1000 (1507 incl. lingering)
+server CPU:         161.7% of one core
+server RSS:         avg 195.6 MB, max 198.0 MB (start 180.0, end 198.0)
+server goroutines:  avg 7517 (start 7358, end 7416)
+server tick:        mean 8.3µs, max 43.64ms
+bot exit: 0
+bot_max_rss_kb=112984 bot_cpu_user_s=48.03 bot_cpu_sys_s=49.57
+bot stderr lines (errors): 0
+server_peak_VmHWM:	  193408 kB
+server exit code: 0, shutdown took .113523135s
+server_error_log_lines=0
+Mem:            7942        1406        1396         172        5503        6535
+host free after: 6.18 GB
+=== step 2000 pairs, host free before: 6.18 GB ===
+bots:               4000 (2000 pairs)
+ramp / measured:    6.0s / 60.0s
+matches finished:   5880
+errors / dropped:   0 / 0
+inputs sent:        595697
+messages received:  1106771 (18446/s, 920.4 MB)
+input->ack latency: p50=28.0ms p95=56.4ms p99=94.5ms max=275.8ms (n=595700)
+server connections: avg 4000, min 3996; live matches avg 2000 (3020 incl. lingering)
+server CPU:         269.7% of one core
+server RSS:         avg 359.1 MB, max 361.1 MB (start 346.5, end 360.3)
+server goroutines:  avg 15031 (start 14973, end 14900)
+server tick:        mean 18.4µs, max 174.64ms
+bot exit: 0
+bot_max_rss_kb=205848 bot_cpu_user_s=87.20 bot_cpu_sys_s=69.46
+bot stderr lines (errors): 0
+server_peak_VmHWM:	  352632 kB
+server exit code: 0, shutdown took .209324447s
+server_error_log_lines=0
+Mem:            7942        1414        1390         172        5502        6528
+host free after: 7.18 GB
+=== step 3000 pairs, host free before: 6.93 GB ===
+bots:               6000 (3000 pairs)
+ramp / measured:    8.4s / 60.0s
+matches finished:   8356
+errors / dropped:   0 / 1
+inputs sent:        836467
+messages received:  1593051 (26551/s, 1329.3 MB)
+input->ack latency: p50=69.9ms p95=693.7ms p99=2046.1ms max=5243.6ms (n=833785)
+server connections: avg 5973, min 5864; live matches avg 2955 (4405 incl. lingering)
+server CPU:         373.0% of one core
+server RSS:         avg 514.9 MB, max 517.3 MB (start 489.0, end 517.3)
+server goroutines:  avg 22362 (start 22494, end 22224)
+server tick:        mean 55.6µs, max 403.51ms
+bot exit: 0
+bot_max_rss_kb=303616 bot_cpu_user_s=111.66 bot_cpu_sys_s=65.77
+bot stderr lines (errors): 1
+server_peak_VmHWM:	  505224 kB
+server exit code: 0, shutdown took .255722399s
+server_error_log_lines=0
+Mem:            7942        1405        1398         172        5503        6537
+host free after: 6.45 GB

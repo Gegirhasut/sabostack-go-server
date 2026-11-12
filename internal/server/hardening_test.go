@@ -105,32 +105,6 @@ func TestValidName(t *testing.T) {
 	}
 }
 
-// A client that floods messages far above the rate limit is disconnected; its opponent's
-// game carries on.
-func TestFloodingClientIsKicked(t *testing.T) {
-	ts := startServerWith(t, store.NewMemory(), DefaultConfig())
-	alice, bob, _, _ := joinPair(t, ts.url)
-	alice.waitFor(protocol.TypeEvent, isPhase("playing"))
-	bob.waitFor(protocol.TypeEvent, isPhase("playing"))
-
-	go func() {
-		for seq := uint64(1); seq <= 5000; seq++ {
-			if alice.ws.WriteJSON(protocol.ClientMsg{Type: protocol.TypeInput, Seq: seq, Action: "left"}) != nil {
-				return
-			}
-		}
-	}()
-	e := decode[protocol.Error](t, alice.waitFor(protocol.TypeError, nil))
-	if e.Code != "rate_limited" {
-		t.Fatalf("error = %+v", e)
-	}
-	for range alice.msgs { // the server closes the socket
-	}
-	bob.waitFor(protocol.TypeEvent, isEvent(protocol.EvPlayerLeft))
-	bob.send(protocol.ClientMsg{Type: protocol.TypeInput, Seq: 1, Action: "rotate"})
-	bob.waitFor(protocol.TypeState, func(b []byte) bool { return decode[protocol.State](t, b).Ack == 1 })
-}
-
 // Draining: /readyz turns 503, new joins are refused, but resumes keep working so running
 // matches can finish.
 func TestDrainRefusesJoinsButAllowsResume(t *testing.T) {

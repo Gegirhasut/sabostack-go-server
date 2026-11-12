@@ -114,14 +114,10 @@ func NewWithConfig(mgr *match.Manager, met *metrics.Metrics, gatherer prometheus
 			s.origins[o] = true
 		}
 	}
-	s.upgrader = websocket.Upgrader{
-		CheckOrigin:     s.checkOrigin,
-		ReadBufferSize:  1024,
-		WriteBufferSize: 4096,
-		// Write buffers are borrowed only while a frame is written, instead of being held
-		// by every idle connection.
-		WriteBufferPool: &sync.Pool{},
-	}
+	// Default buffer sizes on purpose: gorilla then reuses the 4 KB buffers net/http
+	// already allocated for the connection. A WriteBufferPool was measured to add heap
+	// (≈ +8 MB at 4000 connections), not save it.
+	s.upgrader = websocket.Upgrader{CheckOrigin: s.checkOrigin}
 	return s
 }
 
