@@ -3,6 +3,8 @@
 package lobby
 
 import (
+	"container/list"
+	"context"
 	"errors"
 	"sync"
 )
@@ -26,17 +28,21 @@ type CreateFunc func(names [2]string) (string, [2]string, error)
 type Ticket struct {
 	Name string
 	c    chan Assignment
+	ctx  context.Context // done when the player's connection is gone
+	elem *list.Element   // position in the queue while waiting (guarded by Queue.mu)
 }
 
 // C delivers the assignment (or an error).
 func (t *Ticket) C() <-chan Assignment { return t.c }
 
-// Queue pairs players in arrival order.
+func (t *Ticket) gone() bool { return t.ctx.Err() != nil }
+
+// Queue pairs players in arrival order. Join and Leave are O(1).
 type Queue struct {
 	create CreateFunc
 
 	mu      sync.Mutex
-	waiting []*Ticket
+	waiting list.List // of *Ticket
 	closed  bool
 }
 
@@ -44,21 +50,35 @@ type Queue struct {
 func New(create CreateFunc) *Queue { return &Queue{create: create} }
 
 // Join enqueues a player. If someone was already waiting, both are matched immediately.
-func (q *Queue) Join(name string) *Ticket {
-	t := &Ticket{Name: name, c: make(chan Assignment, 1)}
+func (q *Queue) Join(name string) *Ticket { return q.JoinContext(context.Background(), name) }
+
+// JoinContext is Join for a player whose connection is tied to ctx. A waiting player whose
+// ctx is done is skipped instead of being paired, so nobody is matched with an opponent
+// who already left and then has to sit out the join timeout.
+func (q *Queue) JoinContext(ctx context.Context, name string) *Ticket {
+	t := &Ticket{Name: name, c: make(chan Assignment, 1), ctx: ctx}
 	q.mu.Lock()
 	if q.closed {
 		q.mu.Unlock()
 		t.c <- Assignment{Err: ErrClosed}
 		return t
 	}
-	if len(q.waiting) == 0 {
-		q.waiting = append(q.waiting, t)
+	var first *Ticket
+	for e := q.waiting.Front(); e != nil; e = q.waiting.Front() {
+		w := q.waiting.Remove(e).(*Ticket)
+		w.elem = nil
+		if w.gone() {
+			w.c <- Assignment{Err: context.Canceled}
+			continue
+		}
+		first = w
+		break
+	}
+	if first == nil {
+		t.elem = q.waiting.PushBack(t)
 		q.mu.Unlock()
 		return t
 	}
-	first := q.waiting[0]
-	q.waiting = q.waiting[1:]
 	q.mu.Unlock()
 
 	// Create outside the lock: starting a match must not stall other joins.
@@ -69,24 +89,23 @@ func (q *Queue) Join(name string) *Ticket {
 }
 
 // Leave removes a ticket that is still waiting (the player disconnected). It reports
-// whether the ticket was removed; false means it was already matched.
+// whether the ticket was removed; false means it was already matched (or skipped).
 func (q *Queue) Leave(t *Ticket) bool {
 	q.mu.Lock()
 	defer q.mu.Unlock()
-	for i, w := range q.waiting {
-		if w == t {
-			q.waiting = append(q.waiting[:i], q.waiting[i+1:]...)
-			return true
-		}
+	if t.elem == nil {
+		return false
 	}
-	return false
+	q.waiting.Remove(t.elem)
+	t.elem = nil
+	return true
 }
 
 // Len is the number of waiting players.
 func (q *Queue) Len() int {
 	q.mu.Lock()
 	defer q.mu.Unlock()
-	return len(q.waiting)
+	return q.waiting.Len()
 }
 
 // Close rejects new joins and fails every waiting ticket.
@@ -94,8 +113,10 @@ func (q *Queue) Close() {
 	q.mu.Lock()
 	defer q.mu.Unlock()
 	q.closed = true
-	for _, t := range q.waiting {
+	for e := q.waiting.Front(); e != nil; e = e.Next() {
+		t := e.Value.(*Ticket)
+		t.elem = nil
 		t.c <- Assignment{Err: ErrClosed}
 	}
-	q.waiting = nil
+	q.waiting.Init()
 }

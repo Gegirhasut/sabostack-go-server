@@ -54,7 +54,9 @@ func startServer(t *testing.T, st store.Store) *testServer {
 	if _, err := mgr.Restore(context.Background()); err != nil {
 		t.Fatal(err)
 	}
-	s := New(mgr, met, reg, log)
+	cfg := DefaultConfig()
+	cfg.InputRate = 0 // hammer() sends 200 inputs/s to end matches fast
+	s := NewWithConfig(mgr, met, reg, log, cfg)
 	hs := httptest.NewServer(s.Handler())
 	ts := &testServer{srv: s, http: hs, url: "ws" + strings.TrimPrefix(hs.URL, "http") + "/ws"}
 	t.Cleanup(func() { ts.stop(t) })

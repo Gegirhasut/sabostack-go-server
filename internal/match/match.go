@@ -28,9 +28,14 @@ type Config struct {
 	JoinTimeout    time.Duration // both players must connect within this after matchmaking
 	ReconnectGrace time.Duration // a disconnected player may come back within this
 	IdleTimeout    time.Duration // a connected player sending no input for this long forfeits
-	WinsNeeded     int           // rounds needed to win the match
+	// PauseBudget caps the total time one player may keep the match paused by being away
+	// (summed over all disconnects). Without it a losing player could freeze the game
+	// forever by reconnecting just before the grace runs out. 0 disables the cap.
+	PauseBudget    time.Duration
+	WinsNeeded     int // rounds needed to win the match
 	MaxRounds      int
 	EventLogSize   int // events kept for reconnect catch-up
+	SnapshotEvents int // newest events kept in a persisted snapshot (0 = all of the log)
 }
 
 // DefaultConfig is used by the server unless overridden by flags.
@@ -44,9 +49,11 @@ func DefaultConfig() Config {
 		JoinTimeout:    15 * time.Second,
 		ReconnectGrace: 20 * time.Second,
 		IdleTimeout:    30 * time.Second,
+		PauseBudget:    45 * time.Second,
 		WinsNeeded:     2,
 		MaxRounds:      3,
 		EventLogSize:   256,
+		SnapshotEvents: 32,
 	}
 }
 
@@ -82,14 +89,15 @@ const NoSeat = -1
 
 // Seat is one player's slot. Everything except the sink is persisted in snapshots.
 type Seat struct {
-	Name      string      `json:"name"`
-	TokenHash string      `json:"tokenHash"` // sha256 of the session token; the token itself is never stored
-	Connected bool        `json:"connected"`
-	LeftAt    time.Time   `json:"leftAt"`
-	LastInput time.Time   `json:"lastInput"`
-	LastSeq   uint64      `json:"lastSeq"` // highest input seq consumed (idempotency)
-	Wins      int         `json:"wins"`
-	Board     *game.Board `json:"board"`
+	Name      string        `json:"name"`
+	TokenHash string        `json:"tokenHash"` // sha256 of the session token; the token itself is never stored
+	Connected bool          `json:"connected"`
+	LeftAt    time.Time     `json:"leftAt"`
+	LastInput time.Time     `json:"lastInput"`
+	LastSeq   uint64        `json:"lastSeq"`  // highest input seq consumed (idempotency)
+	AwayUsed  time.Duration `json:"awayUsed"` // pause time this player has caused so far
+	Wins      int           `json:"wins"`
+	Board     *game.Board   `json:"board"`
 
 	sink Sink
 }
@@ -112,8 +120,18 @@ type Match struct {
 	EndedAt     time.Time        `json:"endedAt"`
 
 	cfg   Config
-	dirty bool // state changed since the last broadcast
+	dirty bool   // state changed since the last broadcast
+	rev   uint64 // bumped on every change; lets the actor skip identical snapshots
 }
+
+// touch marks the state as changed (for the next broadcast and the next snapshot).
+func (m *Match) touch() {
+	m.dirty = true
+	m.rev++
+}
+
+// Rev is a counter that changes whenever the match state changes.
+func (m *Match) Rev() uint64 { return m.rev }
 
 // New creates a match in the Waiting phase and returns the session tokens for both seats.
 func New(id string, cfg Config, names [2]string, seed uint64, now time.Time) (*Match, [2]string) {
@@ -142,8 +160,14 @@ func (m *Match) Attach(token string, sink Sink, lastEventSeq uint64, now time.Ti
 	if s.sink != nil && s.sink != sink {
 		s.sink.Close("replaced by a newer connection")
 	}
+	// The new sink is attached only after its snapshot is sent: player_back below is
+	// delivered inside the snapshot, never as a separate event ahead of it (or twice).
+	s.sink = nil
 	wasAway := !s.Connected
-	s.sink, s.Connected, s.LeftAt = sink, true, time.Time{}
+	if wasAway && !m.PausedAt.IsZero() && (m.Phase == Countdown || m.Phase == Playing) {
+		s.AwayUsed += now.Sub(later(s.LeftAt, m.PausedAt))
+	}
+	s.Connected, s.LeftAt = true, time.Time{}
 	if m.Phase == Playing {
 		s.LastInput = now // don't count time away as idle
 	}
@@ -155,7 +179,8 @@ func (m *Match) Attach(token string, sink Sink, lastEventSeq uint64, now time.Ti
 		Type: protocol.TypeSnapshot, MatchID: m.ID, Seat: seat,
 		State: m.StateFor(seat, now), Events: events, EventsComplete: complete,
 	})
-	m.dirty = true
+	s.sink = sink
+	m.touch()
 	if m.Phase == MatchEnd {
 		return seat, ErrMatchEnded // the snapshot still told the client the result
 	}
@@ -173,7 +198,7 @@ func (m *Match) Detach(seat int, sink Sink, now time.Time) {
 	if m.Phase != MatchEnd {
 		m.emit(now, protocol.Event{Kind: protocol.EvPlayerLeft, Seat: intp(seat)})
 	}
-	m.dirty = true
+	m.touch()
 }
 
 // Input applies a player action. seq makes inputs idempotent: anything at or below the
@@ -188,7 +213,7 @@ func (m *Match) Input(seat int, seq uint64, a game.Action, now time.Time) InputR
 		return InputInvalid
 	}
 	s.LastSeq = seq
-	m.dirty = true // the ack changed even if nothing else did
+	m.touch() // the ack changed even if nothing else did
 	if m.Phase != Playing || !m.PausedAt.IsZero() {
 		return InputNotPlaying
 	}
@@ -229,13 +254,11 @@ func (m *Match) Advance(now time.Time) {
 // connection is not a free loss) and forfeits whoever outstays the reconnect grace.
 // It returns true while the match is paused.
 func (m *Match) checkPause(now time.Time) bool {
-	away := []int{}
-	for i, s := range m.Seats {
-		if !s.Connected {
-			away = append(away, i)
-		}
+	anyAway := false
+	for _, s := range m.Seats {
+		anyAway = anyAway || !s.Connected
 	}
-	if len(away) == 0 {
+	if !anyAway {
 		if !m.PausedAt.IsZero() {
 			shift := now.Sub(m.PausedAt)
 			m.PhaseEnds = m.PhaseEnds.Add(shift)
@@ -252,19 +275,30 @@ func (m *Match) checkPause(now time.Time) bool {
 		m.PausedAt = now
 		m.emit(now, protocol.Event{Kind: protocol.EvPaused})
 	}
-	expired := []int{}
-	for _, i := range away {
-		if now.Sub(m.Seats[i].LeftAt) >= m.cfg.ReconnectGrace {
-			expired = append(expired, i)
+	var expired [2]bool
+	for i, s := range m.Seats {
+		if s.Connected {
+			continue
 		}
+		overBudget := m.cfg.PauseBudget > 0 && s.AwayUsed+now.Sub(later(s.LeftAt, m.PausedAt)) >= m.cfg.PauseBudget
+		expired[i] = overBudget || now.Sub(s.LeftAt) >= m.cfg.ReconnectGrace
 	}
-	switch len(expired) {
-	case 1:
-		m.finish(now, 1-expired[0], "opponent_disconnected")
-	case 2:
+	switch {
+	case expired[0] && expired[1]:
 		m.finish(now, NoSeat, "both_disconnected")
+	case expired[0]:
+		m.finish(now, 1, "opponent_disconnected")
+	case expired[1]:
+		m.finish(now, 0, "opponent_disconnected")
 	}
 	return true
+}
+
+func later(a, b time.Time) time.Time {
+	if a.After(b) {
+		return a
+	}
+	return b
 }
 
 func (m *Match) play(now time.Time) {
@@ -278,11 +312,18 @@ func (m *Match) play(now time.Time) {
 			}
 		}
 	}
-	for i, s := range m.Seats {
-		if now.Sub(s.LastInput) >= m.cfg.IdleTimeout {
-			m.finish(now, 1-i, "opponent_idle")
-			return
-		}
+	idle0 := now.Sub(m.Seats[0].LastInput) >= m.cfg.IdleTimeout
+	idle1 := now.Sub(m.Seats[1].LastInput) >= m.cfg.IdleTimeout
+	switch {
+	case idle0 && idle1: // nobody is playing: no winner (seat 0 used to lose by default)
+		m.finish(now, NoSeat, "both_idle")
+		return
+	case idle0:
+		m.finish(now, 1, "opponent_idle")
+		return
+	case idle1:
+		m.finish(now, 0, "opponent_idle")
+		return
 	}
 	if !now.Before(m.PhaseEnds) {
 		a, b := m.Seats[0].Board, m.Seats[1].Board
@@ -300,7 +341,7 @@ func (m *Match) play(now time.Time) {
 // handle turns a board result into attacks, events and round decisions.
 func (m *Match) handle(seat int, r game.Result, now time.Time) {
 	if r.Moved || r.Locked {
-		m.dirty = true
+		m.touch()
 	}
 	me, opp := m.Seats[seat].Board, m.Seats[1-seat].Board
 	if r.Cleared > 0 {
@@ -386,7 +427,7 @@ func (m *Match) Transition(to Phase) error {
 		return &ErrIllegalTransition{From: m.Phase, To: to}
 	}
 	m.Phase = to
-	m.dirty = true
+	m.touch()
 	return nil
 }
 
@@ -404,9 +445,12 @@ func (m *Match) emit(now time.Time, e protocol.Event) {
 	e.Seq, e.AtMs = m.EventSeq, now.UnixMilli()
 	m.Events = append(m.Events, e)
 	if n := len(m.Events) - m.cfg.EventLogSize; n > 0 && m.cfg.EventLogSize > 0 {
-		m.Events = append(m.Events[:0:0], m.Events[n:]...)
+		// Trim in place: no new allocation per event once the log is full.
+		k := copy(m.Events, m.Events[n:])
+		clear(m.Events[k:])
+		m.Events = m.Events[:k]
 	}
-	m.dirty = true
+	m.touch()
 	msg := protocol.EventMsg{Type: protocol.TypeEvent, Event: e}
 	for _, s := range m.Seats {
 		if s.sink != nil {

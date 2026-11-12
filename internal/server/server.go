@@ -5,10 +5,16 @@ import (
 	"context"
 	"errors"
 	"log/slog"
+	"net"
 	"net/http"
+	"net/http/pprof"
+	"net/url"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
+	"unicode"
+	"unicode/utf8"
 
 	"github.com/gorilla/websocket"
 	"github.com/prometheus/client_golang/prometheus"
@@ -18,9 +24,45 @@ import (
 	"github.com/Gegirhasut/sabostack-go-server/internal/match"
 	"github.com/Gegirhasut/sabostack-go-server/internal/metrics"
 	"github.com/Gegirhasut/sabostack-go-server/internal/protocol"
+	"github.com/Gegirhasut/sabostack-go-server/internal/store"
 )
 
-const helloTimeout = 10 * time.Second
+// Config holds the transport and abuse-protection settings.
+type Config struct {
+	// AllowedOrigins lists the accepted browser Origin hosts (e.g. "game.example.com").
+	// Empty accepts any origin. Requests without an Origin header (native apps) are
+	// always accepted.
+	AllowedOrigins []string
+	MaxConns       int  // open WebSockets per process; 0 = unlimited
+	MaxConnsPerIP  int  // open WebSockets per client IP; 0 = unlimited
+	TrustProxy     bool // take the client IP from X-Forwarded-For (only behind a trusted proxy)
+
+	HelloTimeout time.Duration // first message (join/resume) must arrive within this
+	PingInterval time.Duration // server ping frames
+	PongWait     time.Duration // a socket silent for this long is considered dead
+
+	InputRate  float64 // client messages per second per connection; 0 = unlimited
+	InputBurst float64
+
+	PublicMetrics bool   // also serve /metrics on the public handler
+	NodeID        string // this node's id, to tell local from remote owners on resume
+}
+
+// DefaultConfig returns safe defaults. The heartbeat keeps the original tolerant timings:
+// a 3 s ping / 10 s pong-wait was tried and, on an overloaded host, disconnected clients
+// that were merely slow to read. Tighten PingInterval/PongWait (flags) only after
+// measuring on real mobile networks; PongWait is how long a silently dropped connection
+// keeps counting as connected (and so is not paused).
+func DefaultConfig() Config {
+	return Config{
+		HelloTimeout:  10 * time.Second,
+		PingInterval:  20 * time.Second,
+		PongWait:      30 * time.Second,
+		InputRate:     40,
+		InputBurst:    20,
+		PublicMetrics: true,
+	}
+}
 
 // Server wires the matchmaking queue and match manager to WebSocket clients.
 type Server struct {
@@ -29,37 +71,128 @@ type Server struct {
 	metrics  *metrics.Metrics
 	gatherer prometheus.Gatherer
 	log      *slog.Logger
+	cfg      Config
 	upgrader websocket.Upgrader
+	origins  map[string]bool
+	limits   connLimits
 
-	conns sync.WaitGroup
+	conns    sync.WaitGroup
+	open     atomic.Int64
+	ipMu     sync.Mutex
+	perIP    map[string]int
+	draining atomic.Bool
 }
 
-// New creates a Server. gatherer is the registry served on /metrics.
+// New creates a Server with DefaultConfig. gatherer is the registry served on /metrics.
 func New(mgr *match.Manager, met *metrics.Metrics, gatherer prometheus.Gatherer, log *slog.Logger) *Server {
-	return &Server{
-		mgr: mgr, queue: lobby.New(mgr.Create), metrics: met, gatherer: gatherer, log: log,
-		// This is a demo server: accept any origin. A real deployment would check Origin.
-		upgrader: websocket.Upgrader{CheckOrigin: func(*http.Request) bool { return true }},
-	}
+	return NewWithConfig(mgr, met, gatherer, log, DefaultConfig())
 }
 
-// Handler returns the HTTP routes.
+// NewWithConfig creates a Server.
+func NewWithConfig(mgr *match.Manager, met *metrics.Metrics, gatherer prometheus.Gatherer, log *slog.Logger, cfg Config) *Server {
+	def := DefaultConfig()
+	if cfg.HelloTimeout <= 0 {
+		cfg.HelloTimeout = def.HelloTimeout
+	}
+	if cfg.PingInterval <= 0 {
+		cfg.PingInterval = def.PingInterval
+	}
+	if cfg.PongWait <= cfg.PingInterval {
+		cfg.PongWait = max(def.PongWait, 3*cfg.PingInterval)
+	}
+	s := &Server{
+		mgr: mgr, queue: lobby.New(mgr.Create), metrics: met, gatherer: gatherer, log: log, cfg: cfg,
+		origins: map[string]bool{}, perIP: map[string]int{},
+		limits: connLimits{
+			pingInterval: cfg.PingInterval, pongWait: cfg.PongWait,
+			rate: cfg.InputRate, burst: cfg.InputBurst,
+			rateLimited: met.Input("rate_limited"), kicked: met.Kicked,
+		},
+	}
+	for _, o := range cfg.AllowedOrigins {
+		if o = strings.ToLower(strings.TrimSpace(o)); o != "" {
+			s.origins[o] = true
+		}
+	}
+	s.upgrader = websocket.Upgrader{
+		CheckOrigin:     s.checkOrigin,
+		ReadBufferSize:  1024,
+		WriteBufferSize: 4096,
+		// Write buffers are borrowed only while a frame is written, instead of being held
+		// by every idle connection.
+		WriteBufferPool: &sync.Pool{},
+	}
+	return s
+}
+
+func (s *Server) checkOrigin(r *http.Request) bool {
+	origin := r.Header.Get("Origin")
+	if origin == "" || len(s.origins) == 0 {
+		return true
+	}
+	u, err := url.Parse(origin)
+	return err == nil && s.origins[strings.ToLower(u.Host)]
+}
+
+// Handler returns the public routes: the WebSocket endpoint and health checks (plus
+// /metrics if Config.PublicMetrics).
 func (s *Server) Handler() http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /ws", s.handleWS)
+	s.health(mux)
+	if s.cfg.PublicMetrics {
+		mux.Handle("GET /metrics", promhttp.HandlerFor(s.gatherer, promhttp.HandlerOpts{}))
+	}
+	return mux
+}
+
+// AdminHandler returns the internal routes: metrics, health and pprof. Serve it on a
+// private address only.
+func (s *Server) AdminHandler() http.Handler {
+	mux := http.NewServeMux()
+	s.health(mux)
+	mux.Handle("GET /metrics", promhttp.HandlerFor(s.gatherer, promhttp.HandlerOpts{}))
+	mux.HandleFunc("/debug/pprof/", pprof.Index)
+	mux.HandleFunc("/debug/pprof/cmdline", pprof.Cmdline)
+	mux.HandleFunc("/debug/pprof/profile", pprof.Profile)
+	mux.HandleFunc("/debug/pprof/symbol", pprof.Symbol)
+	mux.HandleFunc("/debug/pprof/trace", pprof.Trace)
+	return mux
+}
+
+func (s *Server) health(mux *http.ServeMux) {
+	// healthz: the process is alive. readyz: it wants new players (503 while draining, so
+	// the load balancer sends new connections elsewhere).
 	mux.HandleFunc("GET /healthz", func(w http.ResponseWriter, _ *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		_, _ = w.Write([]byte(`{"status":"ok"}`))
 	})
-	mux.Handle("GET /metrics", promhttp.HandlerFor(s.gatherer, promhttp.HandlerOpts{}))
-	return mux
+	mux.HandleFunc("GET /readyz", func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		if s.draining.Load() {
+			w.WriteHeader(http.StatusServiceUnavailable)
+			_, _ = w.Write([]byte(`{"status":"draining"}`))
+			return
+		}
+		_, _ = w.Write([]byte(`{"status":"ready"}`))
+	})
+}
+
+// Drain stops matchmaking on this node: /readyz turns 503, queued players are told to
+// go elsewhere, and new joins are refused. Running matches and resumes keep working, so
+// they can finish before the process exits.
+func (s *Server) Drain() {
+	if s.draining.Swap(true) {
+		return
+	}
+	s.queue.Close()
 }
 
 // Shutdown stops matchmaking, snapshots and stops all matches (which closes their
 // sockets), then waits for connection handlers to exit. Call it after http.Server.Shutdown
 // has stopped accepting new connections.
 func (s *Server) Shutdown(ctx context.Context) error {
-	s.queue.Close()
+	s.Drain()
 	err := s.mgr.Shutdown(ctx)
 	done := make(chan struct{})
 	go func() { s.conns.Wait(); close(done) }()
@@ -71,9 +204,60 @@ func (s *Server) Shutdown(ctx context.Context) error {
 	return err
 }
 
+func (s *Server) clientIP(r *http.Request) string {
+	if s.cfg.TrustProxy {
+		if xff := r.Header.Get("X-Forwarded-For"); xff != "" {
+			first, _, _ := strings.Cut(xff, ",")
+			return strings.TrimSpace(first)
+		}
+	}
+	host, _, err := net.SplitHostPort(r.RemoteAddr)
+	if err != nil {
+		return r.RemoteAddr
+	}
+	return host
+}
+
+// admit reserves a connection slot for ip, or returns the reason it is refused.
+func (s *Server) admit(ip string) (release func(), reason string) {
+	if n := s.open.Add(1); s.cfg.MaxConns > 0 && n > int64(s.cfg.MaxConns) {
+		s.open.Add(-1)
+		return nil, "max_conns"
+	}
+	if s.cfg.MaxConnsPerIP > 0 {
+		s.ipMu.Lock()
+		if s.perIP[ip] >= s.cfg.MaxConnsPerIP {
+			s.ipMu.Unlock()
+			s.open.Add(-1)
+			return nil, "max_conns_per_ip"
+		}
+		s.perIP[ip]++
+		s.ipMu.Unlock()
+	}
+	return func() {
+		s.open.Add(-1)
+		if s.cfg.MaxConnsPerIP > 0 {
+			s.ipMu.Lock()
+			if s.perIP[ip]--; s.perIP[ip] <= 0 {
+				delete(s.perIP, ip)
+			}
+			s.ipMu.Unlock()
+		}
+	}, ""
+}
+
 func (s *Server) handleWS(w http.ResponseWriter, r *http.Request) {
+	ip := s.clientIP(r)
+	release, reason := s.admit(ip)
+	if release == nil {
+		s.metrics.ConnsRejected.WithLabelValues(reason).Inc()
+		http.Error(w, "too many connections", http.StatusServiceUnavailable)
+		return
+	}
+	defer release()
 	ws, err := s.upgrader.Upgrade(w, r, nil)
 	if err != nil {
+		s.metrics.ConnsRejected.WithLabelValues("upgrade").Inc()
 		return // Upgrade already replied with an HTTP error
 	}
 	s.conns.Add(1)
@@ -81,20 +265,22 @@ func (s *Server) handleWS(w http.ResponseWriter, r *http.Request) {
 	s.metrics.ConnectedPlayers.Inc()
 	defer s.metrics.ConnectedPlayers.Dec()
 
-	c := newClient(ws)
+	c := newClient(ws, s.limits)
 	defer func() { c.Close("bye"); <-c.done }()
 	in := c.readLoop()
-	log := s.log.With("remote", r.RemoteAddr)
+	log := s.log.With("remote", ip)
 
 	// The first message decides the session: join the queue or resume a match.
 	var hello protocol.ClientMsg
+	hold := time.NewTimer(s.cfg.HelloTimeout)
 	select {
 	case msg, ok := <-in:
+		hold.Stop()
 		if !ok {
 			return
 		}
 		hello = msg
-	case <-time.After(helloTimeout):
+	case <-hold.C:
 		c.Send(errMsg("timeout", "expected join or resume"))
 		return
 	}
@@ -105,9 +291,9 @@ func (s *Server) handleWS(w http.ResponseWriter, r *http.Request) {
 	)
 	switch hello.Type {
 	case protocol.TypeJoin:
-		actor, seat, err = s.joinQueue(r.Context(), c, in, hello)
+		actor, seat, err = s.joinQueue(c, in, hello)
 	case protocol.TypeResume:
-		actor, seat, err = s.resume(r.Context(), c, hello.MatchID, hello.Token, hello.LastEventSeq)
+		actor, seat, err = s.resume(c, hello.MatchID, hello.Token, hello.LastEventSeq)
 	default:
 		c.Send(errMsg("bad_request", "first message must be join or resume"))
 		return
@@ -133,13 +319,34 @@ func (s *Server) handleWS(w http.ResponseWriter, r *http.Request) {
 	log.Debug("player detached")
 }
 
-func (s *Server) joinQueue(ctx context.Context, c *client, in <-chan protocol.ClientMsg, hello protocol.ClientMsg) (*match.Actor, int, error) {
+// validName accepts 1-24 printable characters (runes, not bytes).
+func validName(name string) bool {
+	if !utf8.ValidString(name) {
+		return false
+	}
+	n := utf8.RuneCountInString(name)
+	if n == 0 || n > 24 {
+		return false
+	}
+	for _, r := range name {
+		if unicode.IsControl(r) || r == utf8.RuneError || unicode.Is(unicode.Cf, r) {
+			return false
+		}
+	}
+	return true
+}
+
+func (s *Server) joinQueue(c *client, in <-chan protocol.ClientMsg, hello protocol.ClientMsg) (*match.Actor, int, error) {
+	if s.draining.Load() {
+		c.Send(errMsg("unavailable", "server is draining, connect again"))
+		return nil, 0, errors.New("draining")
+	}
 	name := strings.TrimSpace(hello.Name)
-	if name == "" || len(name) > 24 {
-		c.Send(errMsg("bad_name", "name must be 1-24 characters"))
+	if !validName(name) {
+		c.Send(errMsg("bad_name", "name must be 1-24 printable characters"))
 		return nil, 0, errors.New("bad name")
 	}
-	ticket := s.queue.Join(name)
+	ticket := s.queue.JoinContext(c.ctx, name)
 	c.Send(protocol.Queued{Type: protocol.TypeQueued})
 
 	var a lobby.Assignment
@@ -163,17 +370,21 @@ func (s *Server) joinQueue(ctx context.Context, c *client, in <-chan protocol.Cl
 		return nil, 0, a.Err
 	}
 	c.Send(protocol.Matched{Type: protocol.TypeMatched, MatchID: a.MatchID, Seat: a.Seat, Token: a.Token, Opponent: a.Opponent})
-	return s.resume(ctx, c, a.MatchID, a.Token, 0)
+	return s.resume(c, a.MatchID, a.Token, 0)
 }
 
-func (s *Server) resume(ctx context.Context, c *client, matchID, token string, lastEventSeq uint64) (*match.Actor, int, error) {
+func (s *Server) resume(c *client, matchID, token string, lastEventSeq uint64) (*match.Actor, int, error) {
+	ctx, cancel := context.WithTimeout(c.ctx, 5*time.Second)
+	defer cancel()
 	actor, ok := s.mgr.Get(matchID)
 	if !ok {
+		if addr := s.ownerURL(ctx, matchID); addr != "" {
+			c.Send(protocol.Error{Type: protocol.TypeError, Code: "wrong_server", Message: "match is on another server", URL: addr})
+			return nil, 0, errors.New("match on another node")
+		}
 		c.Send(errMsg("match_not_found", "no such match on this server"))
 		return nil, 0, errors.New("match not found")
 	}
-	ctx, cancel := context.WithTimeout(ctx, 5*time.Second)
-	defer cancel()
 	seat, err := actor.Attach(ctx, token, c, lastEventSeq)
 	switch {
 	case errors.Is(err, match.ErrMatchEnded):
@@ -186,4 +397,17 @@ func (s *Server) resume(ctx context.Context, c *client, matchID, token string, l
 		return nil, 0, err
 	}
 	return actor, seat, nil
+}
+
+// ownerURL asks the store's match directory which other node runs matchID.
+func (s *Server) ownerURL(ctx context.Context, matchID string) string {
+	dir, ok := s.mgr.Store().(store.Directory)
+	if !ok || matchID == "" {
+		return ""
+	}
+	node, addr, found, err := dir.Owner(ctx, matchID)
+	if err != nil || !found || node == s.cfg.NodeID {
+		return ""
+	}
+	return addr
 }

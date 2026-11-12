@@ -3,45 +3,168 @@ package store
 import (
 	"context"
 	"errors"
+	"strings"
 	"time"
 
 	"github.com/redis/go-redis/v9"
 )
 
-// Redis stores each snapshot under "<prefix>match:<id>" with a TTL, and keeps the set of
-// live ids in "<prefix>matches" so LoadAll does not need KEYS/SCAN.
+// Redis stores snapshots in Redis.
+//
+// Legacy (single-node) mode, NewRedis: each snapshot lives under "<prefix>match:<id>" with
+// a TTL, and the set "<prefix>matches" lists the ids so LoadAll needs no KEYS/SCAN.
+//
+// Node mode, ForNode: several game servers can share one Redis. Every match has an owner
+// key "<prefix>owner:<id>" = "<node> <publicURL>". Saves and deletes run as Lua scripts
+// that refuse to touch a match another node owns (ErrNotOwner), so two processes can
+// never both drive one match. Each node restores only its own set
+// "<prefix>node:<node>:matches", and Owner lets any node redirect a client to the right
+// server. Node ids must be stable across restarts (e.g. a StatefulSet pod name).
+//
+// The scripts touch keys in different hash slots, so this targets a single Redis (or a
+// Sentinel-managed primary), not Redis Cluster.
 type Redis struct {
 	rdb    redis.UniversalClient
 	prefix string
 	ttl    time.Duration
+	node   string // empty = legacy single-node mode
+	url    string // this node's public WebSocket URL, for redirects
 }
 
-// NewRedis wraps a client. ttl bounds how long an orphaned snapshot (a server that died
-// and never came back) lingers.
+// NewRedis wraps a client in legacy single-node mode. ttl bounds how long an orphaned
+// snapshot (a server that died and never came back) lingers.
 func NewRedis(rdb redis.UniversalClient, prefix string, ttl time.Duration) *Redis {
 	return &Redis{rdb: rdb, prefix: prefix, ttl: ttl}
 }
 
-func (s *Redis) key(id string) string { return s.prefix + "match:" + id }
-func (s *Redis) setKey() string       { return s.prefix + "matches" }
+// ForNode returns a copy of s in node mode: matches are owned by node, and clients that
+// reach another server are redirected to publicURL.
+func (s *Redis) ForNode(node, publicURL string) *Redis {
+	c := *s
+	c.node, c.url = node, publicURL
+	return &c
+}
+
+// chunk bounds MGET sizes so a restore never sends one giant command.
+const chunk = 500
+
+func (s *Redis) key(id string) string      { return s.prefix + "match:" + id }
+func (s *Redis) ownerKey(id string) string { return s.prefix + "owner:" + id }
+func (s *Redis) setKey() string {
+	if s.node == "" {
+		return s.prefix + "matches"
+	}
+	return s.prefix + "node:" + s.node + ":matches"
+}
+func (s *Redis) ownerValue() string { return s.node + " " + s.url }
+
+// KEYS: data, owner, node set. ARGV: data, ttl ms, owner value, node, id.
+var saveScript = redis.NewScript(`
+local cur = redis.call('GET', KEYS[2])
+if cur and string.sub(cur, 1, #ARGV[4] + 1) ~= ARGV[4] .. ' ' then
+  redis.call('SREM', KEYS[3], ARGV[5])
+  return 0
+end
+redis.call('SET', KEYS[1], ARGV[1], 'PX', ARGV[2])
+redis.call('SET', KEYS[2], ARGV[3], 'PX', ARGV[2])
+redis.call('SADD', KEYS[3], ARGV[5])
+return 1
+`)
+
+// KEYS: data, owner, node set. ARGV: node, id.
+var deleteScript = redis.NewScript(`
+redis.call('SREM', KEYS[3], ARGV[2])
+local cur = redis.call('GET', KEYS[2])
+if cur and string.sub(cur, 1, #ARGV[1] + 1) ~= ARGV[1] .. ' ' then
+  return 0
+end
+redis.call('DEL', KEYS[1], KEYS[2])
+return 1
+`)
 
 func (s *Redis) Save(ctx context.Context, id string, data []byte) error {
-	_, err := s.rdb.TxPipelined(ctx, func(p redis.Pipeliner) error {
-		p.Set(ctx, s.key(id), data, s.ttl)
-		p.SAdd(ctx, s.setKey(), id)
-		return nil
-	})
-	return err
+	return s.Apply(ctx, []Op{{ID: id, Data: data}})[0]
 }
 
 func (s *Redis) Delete(ctx context.Context, id string) error {
-	_, err := s.rdb.TxPipelined(ctx, func(p redis.Pipeliner) error {
-		p.Del(ctx, s.key(id))
-		p.SRem(ctx, s.setKey(), id)
+	return s.Apply(ctx, []Op{{ID: id}})[0]
+}
+
+// Apply implements Batcher: all ops go out in one pipeline (one round trip).
+func (s *Redis) Apply(ctx context.Context, ops []Op) []error {
+	errs := make([]error, len(ops))
+	if len(ops) == 0 {
+		return errs
+	}
+	if s.node == "" {
+		_, err := s.rdb.TxPipelined(ctx, func(p redis.Pipeliner) error {
+			for _, op := range ops {
+				if op.Data == nil {
+					p.Del(ctx, s.key(op.ID))
+					p.SRem(ctx, s.setKey(), op.ID)
+				} else {
+					p.Set(ctx, s.key(op.ID), op.Data, s.ttl)
+					p.SAdd(ctx, s.setKey(), op.ID)
+				}
+			}
+			return nil
+		})
+		for i := range errs {
+			errs[i] = err
+		}
+		return errs
+	}
+
+	cmds := s.runScripts(ctx, ops, true)
+	var retry []int
+	for i, c := range cmds {
+		if err := c.Err(); err != nil && isNoScript(err) {
+			retry = append(retry, i)
+		}
+	}
+	if len(retry) > 0 { // Redis restarted and lost its script cache: send the bodies
+		sub := make([]Op, len(retry))
+		for j, i := range retry {
+			sub[j] = ops[i]
+		}
+		for j, c := range s.runScripts(ctx, sub, false) {
+			cmds[retry[j]] = c
+		}
+	}
+	for i, c := range cmds {
+		n, err := c.Int()
+		switch {
+		case err != nil:
+			errs[i] = err
+		case n == 0:
+			errs[i] = ErrNotOwner
+		}
+	}
+	return errs
+}
+
+func (s *Redis) runScripts(ctx context.Context, ops []Op, sha bool) []*redis.Cmd {
+	cmds := make([]*redis.Cmd, len(ops))
+	ttl := s.ttl.Milliseconds()
+	_, _ = s.rdb.Pipelined(ctx, func(p redis.Pipeliner) error {
+		for i, op := range ops {
+			keys := []string{s.key(op.ID), s.ownerKey(op.ID), s.setKey()}
+			script, args := deleteScript, []any{s.node, op.ID}
+			if op.Data != nil {
+				script, args = saveScript, []any{op.Data, ttl, s.ownerValue(), s.node, op.ID}
+			}
+			if sha {
+				cmds[i] = script.EvalSha(ctx, p, keys, args...)
+			} else {
+				cmds[i] = script.Eval(ctx, p, keys, args...)
+			}
+		}
 		return nil
 	})
-	return err
+	return cmds
 }
+
+func isNoScript(err error) bool { return strings.HasPrefix(err.Error(), "NOSCRIPT") }
 
 func (s *Redis) LoadAll(ctx context.Context) (map[string][]byte, error) {
 	ids, err := s.rdb.SMembers(ctx, s.setKey()).Result()
@@ -49,30 +172,61 @@ func (s *Redis) LoadAll(ctx context.Context) (map[string][]byte, error) {
 		return nil, err
 	}
 	out := make(map[string][]byte, len(ids))
-	if len(ids) == 0 {
-		return out, nil
-	}
-	keys := make([]string, len(ids))
-	for i, id := range ids {
-		keys[i] = s.key(id)
-	}
-	vals, err := s.rdb.MGet(ctx, keys...).Result()
-	if err != nil {
-		return nil, err
-	}
-	var expired []any
-	for i, v := range vals {
-		str, ok := v.(string)
-		if !ok { // nil: the snapshot expired, drop the dangling id
-			expired = append(expired, ids[i])
-			continue
+	var stale []any
+	for start := 0; start < len(ids); start += chunk {
+		part := ids[start:min(start+chunk, len(ids))]
+		keys := make([]string, len(part))
+		for i, id := range part {
+			keys[i] = s.key(id)
 		}
-		out[ids[i]] = []byte(str)
+		vals, err := s.rdb.MGet(ctx, keys...).Result()
+		if err != nil {
+			return nil, err
+		}
+		var owners []any
+		if s.node != "" {
+			for i, id := range part {
+				keys[i] = s.ownerKey(id)
+			}
+			if owners, err = s.rdb.MGet(ctx, keys...).Result(); err != nil {
+				return nil, err
+			}
+		}
+		for i, v := range vals {
+			str, ok := v.(string)
+			if !ok { // nil: the snapshot expired, drop the dangling id
+				stale = append(stale, part[i])
+				continue
+			}
+			if owners != nil {
+				if o, ok := owners[i].(string); ok && !strings.HasPrefix(o, s.node+" ") {
+					stale = append(stale, part[i]) // another node took it over
+					continue
+				}
+			}
+			out[part[i]] = []byte(str)
+		}
 	}
-	if len(expired) > 0 {
-		if err := s.rdb.SRem(ctx, s.setKey(), expired...).Err(); err != nil && !errors.Is(err, redis.Nil) {
+	if len(stale) > 0 {
+		if err := s.rdb.SRem(ctx, s.setKey(), stale...).Err(); err != nil && !errors.Is(err, redis.Nil) {
 			return out, err
 		}
 	}
 	return out, nil
+}
+
+// Owner implements Directory. In legacy mode nothing is known about other nodes.
+func (s *Redis) Owner(ctx context.Context, id string) (node, url string, ok bool, err error) {
+	if s.node == "" {
+		return "", "", false, nil
+	}
+	v, err := s.rdb.Get(ctx, s.ownerKey(id)).Result()
+	if errors.Is(err, redis.Nil) {
+		return "", "", false, nil
+	}
+	if err != nil {
+		return "", "", false, err
+	}
+	node, url, _ = strings.Cut(v, " ")
+	return node, url, true, nil
 }

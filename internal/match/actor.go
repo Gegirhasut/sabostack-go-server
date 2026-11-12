@@ -4,37 +4,62 @@ import (
 	"context"
 	"errors"
 	"log/slog"
+	"runtime/debug"
 	"sync"
 	"time"
 
 	"github.com/Gegirhasut/sabostack-go-server/internal/game"
+	"github.com/Gegirhasut/sabostack-go-server/internal/protocol"
 )
 
 // ErrStopped is returned when talking to an actor whose goroutine has exited.
 var ErrStopped = errors.New("match: actor stopped")
 
+// inputQueueSize bounds the inputs buffered per seat. Each seat has its own queue, so a
+// player who floods the server only ever drops their own inputs, never the opponent's.
+const inputQueueSize = 128
+
+// forceSnapshotEvery: a match whose state did not change is still re-snapshotted every
+// this many periodic intervals, so its TTL and SavedAt stay fresh.
+const forceSnapshotEvery = 10
+
+type inputCmd struct {
+	seq uint64
+	act game.Action
+}
+
 // Actor runs one Match in its own goroutine. The goroutine is the only code that ever
-// touches the Match; everything else sends it closures over cmds. That is the whole
-// concurrency story: no mutexes around game state, and simultaneous inputs from both
-// players are simply serialised in arrival order.
+// touches the Match; everything else sends it closures over cmds (or inputs over the
+// per-seat queues). That is the whole concurrency story: no mutexes around game state,
+// and simultaneous inputs from both players are simply serialised in arrival order.
 type Actor struct {
-	id       string
-	m        *Match
-	mgr      *Manager
-	log      *slog.Logger
-	cmds     chan func(now time.Time)
-	stop     chan struct{} // closed by Stop
-	stopOnce sync.Once
-	done     chan struct{} // closed when the goroutine exits
+	id     string
+	m      *Match
+	mgr    *Manager
+	log    *slog.Logger
+	cmds   chan func(now time.Time)
+	inputs [2]chan inputCmd
+
+	stop        chan struct{} // closed by Stop: snapshot and exit
+	stopOnce    sync.Once
+	evicted     chan struct{} // closed when another node owns the match: exit, don't persist
+	evictOnce   sync.Once
+	done        chan struct{} // closed when the goroutine exits
+	lastPhase   Phase
+	snapshotRev uint64 // Match.Rev at the last snapshot
+	finished    bool   // matchFinished ran (only touched by the actor goroutine)
+	deleted     <-chan struct{}
 }
 
 func newActor(m *Match, mgr *Manager) *Actor {
 	return &Actor{
 		id: m.ID, m: m, mgr: mgr,
-		log:  mgr.log.With("match", m.ID),
-		cmds: make(chan func(time.Time), 256),
-		stop: make(chan struct{}),
-		done: make(chan struct{}),
+		log:     mgr.log.With("match", m.ID),
+		cmds:    make(chan func(time.Time), 64),
+		inputs:  [2]chan inputCmd{make(chan inputCmd, inputQueueSize), make(chan inputCmd, inputQueueSize)},
+		stop:    make(chan struct{}),
+		evicted: make(chan struct{}),
+		done:    make(chan struct{}),
 	}
 }
 
@@ -46,11 +71,18 @@ func (a *Actor) Done() <-chan struct{} { return a.done }
 
 func (a *Actor) run() {
 	defer close(a.done)
+	// A bug in one match must not take down the process and every other match on it.
+	defer func() {
+		if r := recover(); r != nil {
+			a.crashed(r)
+		}
+	}()
 	clk, cfg := a.mgr.clock, a.mgr.opts
 	ticker := clk.NewTicker(cfg.Match.TickInterval)
 	defer ticker.Stop()
 	snapEvery := max(1, int(cfg.SnapshotEvery/cfg.Match.TickInterval))
 	ticks := 0
+	a.lastPhase = a.m.Phase
 	a.persist(clk.Now(), false) // a brand-new match is recoverable right away
 
 	for {
@@ -61,34 +93,113 @@ func (a *Actor) run() {
 			}
 			a.m.CloseSinks("server shutting down")
 			return
+		case <-a.evicted:
+			a.log.Warn("match is owned by another node; stopping here without persisting")
+			a.m.CloseSinks("match moved to another server")
+			return
 		case f := <-a.cmds:
-			f(clk.Now())
+			now := clk.Now()
+			a.drainInputs(now) // inputs sent before a command (e.g. Detach) apply before it
+			f(now)
+			a.observe(now)
+		case in := <-a.inputs[0]:
+			a.input(0, in, clk.Now())
+		case in := <-a.inputs[1]:
+			a.input(1, in, clk.Now())
 		case <-ticker.C():
 			start := time.Now() // real time: this measures CPU cost, not game time
 			now := clk.Now()
-			before := a.m.Phase
 			a.m.Advance(now)
 			a.m.Broadcast(now)
-			a.mgr.metrics.TickDuration.Observe(time.Since(start).Seconds())
+			a.mgr.metrics.ObserveTick(time.Since(start))
 			ticks++
+			a.observe(now)
 
-			if a.m.Phase != before {
-				a.log.Info("phase", "from", before.String(), "to", a.m.Phase.String(), "round", a.m.Round)
-			}
 			if a.m.Phase == MatchEnd {
-				if before != MatchEnd {
-					a.mgr.matchFinished(a.m)
-				}
 				if now.Sub(a.m.EndedAt) >= cfg.Linger {
 					a.m.CloseSinks("match over")
+					a.awaitDelete() // the match is over: waiting here costs no gameplay
 					return
 				}
 				continue
 			}
-			if a.m.Phase != before || ticks%snapEvery == 0 {
+			if ticks%snapEvery == 0 && (a.m.Rev() != a.snapshotRev || ticks%(snapEvery*forceSnapshotEvery) == 0) {
 				a.persist(now, false)
 			}
 		}
+	}
+}
+
+func (a *Actor) awaitDelete() {
+	if a.deleted == nil {
+		return
+	}
+	t := time.NewTimer(2 * a.mgr.opts.StoreTimeout)
+	defer t.Stop()
+	select {
+	case <-a.deleted:
+	case <-t.C:
+	}
+}
+
+// observe reacts to phase changes after every step (tick, command or input): a top-out
+// inside Input ends the round without waiting for the next tick to notice.
+func (a *Actor) observe(now time.Time) {
+	p := a.m.Phase
+	if p == a.lastPhase {
+		return
+	}
+	a.log.Info("phase", "from", a.lastPhase.String(), "to", p.String(), "round", a.m.Round)
+	a.lastPhase = p
+	if p == MatchEnd {
+		a.finished = true
+		a.deleted = a.mgr.matchFinished(a.m)
+		return
+	}
+	a.persist(now, false)
+}
+
+func (a *Actor) drainInputs(now time.Time) {
+	for {
+		select {
+		case in := <-a.inputs[0]:
+			a.input(0, in, now)
+		case in := <-a.inputs[1]:
+			a.input(1, in, now)
+		default:
+			return
+		}
+	}
+}
+
+func (a *Actor) input(seat int, in inputCmd, now time.Time) {
+	r := a.m.Input(seat, in.seq, in.act, now)
+	a.mgr.inputCounters[r].Inc()
+	a.observe(now)
+}
+
+// crashed runs on the actor goroutine after a panic. The match state may be corrupt, so it
+// is not snapshotted again; the stored snapshot is deleted so a restart does not restore
+// (and re-crash on) the same state.
+func (a *Actor) crashed(r any) {
+	a.mgr.metrics.ActorPanics.Inc()
+	a.log.Error("match actor panicked; match aborted", "panic", r, "stack", string(debug.Stack()))
+	func() {
+		defer func() { _ = recover() }()
+		over := protocol.EventMsg{Type: protocol.TypeEvent, Event: protocol.Event{
+			Seq: a.m.EventSeq + 1, AtMs: a.mgr.clock.Now().UnixMilli(), Kind: protocol.EvMatchOver,
+			Winner: intp(NoSeat), Reason: "internal_error",
+		}}
+		for _, s := range a.m.Seats {
+			if s != nil && s.sink != nil {
+				s.sink.Send(over)
+			}
+		}
+		a.m.CloseSinks("internal error")
+	}()
+	if !a.finished {
+		a.finished = true
+		a.mgr.matchAborted(a.id)
 	}
 }
 
@@ -98,6 +209,8 @@ func (a *Actor) persist(now time.Time, sync bool) {
 		a.log.Error("snapshot encode failed", "err", err)
 		return
 	}
+	a.snapshotRev = a.m.Rev()
+	a.mgr.metrics.SnapshotBytes.Observe(float64(len(data)))
 	a.mgr.save(a.id, data, sync)
 }
 
@@ -142,17 +255,16 @@ func (a *Actor) Detach(seat int, sink Sink) {
 }
 
 // Input queues a player action without blocking the caller (the socket reader). If the
-// actor is backed up the input is dropped; the client sees it un-acked and may resend
+// seat's queue is full the input is dropped; the client sees it un-acked and may resend
 // with the same seq, which is safe because inputs are idempotent.
 func (a *Actor) Input(seat int, seq uint64, act game.Action) {
-	f := func(now time.Time) {
-		r := a.m.Input(seat, seq, act, now)
-		a.mgr.metrics.Inputs.WithLabelValues(r.String()).Inc()
+	if seat < 0 || seat > 1 {
+		return
 	}
 	select {
-	case a.cmds <- f:
+	case a.inputs[seat] <- inputCmd{seq, act}:
 	default:
-		a.mgr.metrics.Inputs.WithLabelValues("overflow").Inc()
+		a.mgr.overflowCounter.Inc()
 	}
 }
 
@@ -173,9 +285,15 @@ func (a *Actor) Inspect(ctx context.Context, f func(m *Match)) error {
 	}
 }
 
+// requestStop asks the actor to snapshot and exit, without waiting.
+func (a *Actor) requestStop() { a.stopOnce.Do(func() { close(a.stop) }) }
+
+// evict makes the actor exit without persisting (another node owns the match).
+func (a *Actor) evict() { a.evictOnce.Do(func() { close(a.evicted) }) }
+
 // Stop asks the actor to snapshot and exit, and waits for it.
 func (a *Actor) Stop(ctx context.Context) error {
-	a.stopOnce.Do(func() { close(a.stop) })
+	a.requestStop()
 	select {
 	case <-a.done:
 		return nil

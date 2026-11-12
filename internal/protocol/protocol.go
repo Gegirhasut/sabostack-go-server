@@ -134,11 +134,13 @@ type EventMsg struct {
 	Event Event  `json:"event"`
 }
 
-// Error reports a rejected request.
+// Error reports a rejected request. URL is set with code "wrong_server": the match lives
+// on another game server and the client should resume there.
 type Error struct {
 	Type    string `json:"type"`
 	Code    string `json:"code"`
 	Message string `json:"message"`
+	URL     string `json:"url,omitempty"`
 }
 
 // Pong answers a ping.

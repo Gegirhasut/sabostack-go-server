@@ -15,9 +15,15 @@ type snapshot struct {
 	Match   *Match    `json:"match"`
 }
 
-// Snapshot serialises the full match state.
+// Snapshot serialises the full match state. Only the newest cfg.SnapshotEvents events of
+// the reconnect log are kept: the log dominated the snapshot size, and after a restore a
+// client that is further behind still gets the authoritative state (eventsComplete=false).
 func (m *Match) Snapshot(now time.Time) ([]byte, error) {
-	return json.Marshal(snapshot{Version: snapshotVersion, SavedAt: now, Match: m})
+	c := *m
+	if n := m.cfg.SnapshotEvents; n > 0 && len(c.Events) > n {
+		c.Events = c.Events[len(c.Events)-n:]
+	}
+	return json.Marshal(snapshot{Version: snapshotVersion, SavedAt: now, Match: &c})
 }
 
 // Restore rebuilds a match from a snapshot taken at some earlier time.
