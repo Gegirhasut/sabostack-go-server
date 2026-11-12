@@ -34,7 +34,7 @@ type clusterServer struct {
 
 func startClusterServer(t *testing.T, mr *testredis.R, name string) *clusterServer {
 	t.Helper()
-	rdb := redis.NewClient(&redis.Options{Addr: mr.Addr()})
+	rdb := redis.NewClient(mr.Options())
 	t.Cleanup(func() { rdb.Close() })
 	hs := httptest.NewUnstartedServer(nil)
 	url := "ws://" + hs.Listener.Addr().String() + "/ws"

@@ -80,9 +80,15 @@ type Manager struct {
 type persistShard struct {
 	mu      sync.Mutex
 	pending map[string]*persistJob
-	order   []string
-	closed  bool
-	wake    chan struct{}
+	order   []string // ids with a pending write, oldest first
+	// urgent lists ids whose pending write someone is waiting for: a new match's first
+	// snapshot (matchmaking waits on it) or a final snapshot at shutdown. They are written
+	// before the periodic snapshots in order, so a burst of new matches does not queue
+	// behind thousands of routine writes. An id may be in both lists; whichever list
+	// reaches it first writes it.
+	urgent []string
+	closed bool
+	wake   chan struct{}
 }
 
 type persistJob struct {
@@ -127,11 +133,16 @@ func (m *Manager) Create(names [2]string) (string, [2]string, error) {
 	if a == nil {
 		return "", [2]string{}, ErrShuttingDown
 	}
-	// Announce the match only once its first snapshot is written. Before, players were
-	// told about it while the write was still queued: a resume reaching another node in
-	// that window found no owner and got match_not_found (final for the client), and a
-	// crash in that window lost a match the players had already been sent to. The wait
-	// is bounded by the store timeout; a failed write is retried by the actor.
+	// Announce the match only after its first snapshot write has been attempted. Before,
+	// players were told about it while the write was still queued: a resume reaching
+	// another node in that window found no owner and got match_not_found (final for the
+	// client), and a crash in that window lost a match the players had already been sent
+	// to. The write skips the queue of periodic snapshots (persistShard.urgent).
+	//
+	// This is a wait, not a guarantee: if the store is down (the write fails, or the
+	// circuit breaker skips it) the match is still announced, without a stored copy,
+	// rather than refusing to start games while Redis is unavailable. The actor retries
+	// the write on its next snapshot tick. The wait is bounded by the store timeout.
 	<-a.stored
 	select {
 	case <-a.Done(): // stopped before it was announced (shutdown, or the store says another node owns it)
@@ -389,9 +400,29 @@ func (m *Manager) enqueue(id string, data []byte, wait bool) <-chan struct{} {
 		sh.order = append(sh.order, id)
 		m.metrics.PersistPending.Inc()
 	}
+	if done != nil {
+		sh.urgent = append(sh.urgent, id)
+	}
 	sh.mu.Unlock()
 	sh.signal()
 	return done
+}
+
+// take moves pending jobs from the front of queue into jobs until it holds max, and
+// returns what is left of queue. Ids already written through the other list are skipped.
+// Called with sh.mu held.
+func (sh *persistShard) take(queue []string, jobs *[]*persistJob, max int) []string {
+	i := 0
+	for ; i < len(queue) && len(*jobs) < max; i++ {
+		if j, ok := sh.pending[queue[i]]; ok {
+			*jobs = append(*jobs, j)
+			delete(sh.pending, queue[i])
+		}
+	}
+	if i == len(queue) {
+		return queue[:0]
+	}
+	return append(queue[:0], queue[i:]...)
 }
 
 func (sh *persistShard) signal() {
@@ -405,27 +436,21 @@ func (m *Manager) persistLoop(sh *persistShard) {
 	defer m.persistWG.Done()
 	for {
 		sh.mu.Lock()
-		for len(sh.order) == 0 && !sh.closed {
+		for len(sh.pending) == 0 && !sh.closed {
 			sh.mu.Unlock()
 			<-sh.wake
 			sh.mu.Lock()
 		}
-		if len(sh.order) == 0 { // closed and drained
+		if len(sh.pending) == 0 { // closed and drained
+			sh.order, sh.urgent = sh.order[:0], sh.urgent[:0]
 			sh.mu.Unlock()
 			return
 		}
-		n := min(len(sh.order), m.opts.PersistBatch)
-		jobs := make([]*persistJob, n)
-		for i, id := range sh.order[:n] {
-			jobs[i] = sh.pending[id]
-			delete(sh.pending, id)
-		}
-		if n == len(sh.order) {
-			sh.order = sh.order[:0]
-		} else {
-			sh.order = append(sh.order[:0], sh.order[n:]...)
-		}
+		jobs := make([]*persistJob, 0, min(len(sh.pending), m.opts.PersistBatch))
+		sh.urgent = sh.take(sh.urgent, &jobs, m.opts.PersistBatch)
+		sh.order = sh.take(sh.order, &jobs, m.opts.PersistBatch)
 		sh.mu.Unlock()
+		n := len(jobs)
 		m.metrics.PersistPending.Sub(float64(n))
 
 		m.write(jobs)

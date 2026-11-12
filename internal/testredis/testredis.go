@@ -1,15 +1,21 @@
 // Package testredis gives tests a Redis: an in-process miniredis by default, or a real
-// server when SABO_TEST_REDIS=host:port is set. CI runs the Redis-backed tests both ways,
+// server when SABO_TEST_REDIS=host:port/db is set. CI runs the Redis-backed tests both ways,
 // because miniredis does not reproduce every behaviour of real Redis (Lua semantics,
 // EVALSHA/NOSCRIPT, TTL precision) and the cluster's ownership rules live in Lua.
 //
 // The helpers mirror the miniredis methods the tests use, so a test is written once.
-// A real server is flushed at the start of each test: run such packages with -p 1.
+// The chosen database of a real server is flushed at the start of each test, so it must
+// be named explicitly and must not be database 0 (where real data usually lives): a
+// production address set by mistake fails the test instead of being wiped. Run such
+// packages with -p 1.
 package testredis
 
 import (
 	"context"
+	"fmt"
 	"os"
+	"strconv"
+	"strings"
 	"testing"
 	"time"
 
@@ -17,8 +23,21 @@ import (
 	"github.com/redis/go-redis/v9"
 )
 
-// Env names the variable that selects a real Redis server.
+// Env names the variable that selects a real Redis server: host:port/db, db 1-15.
 const Env = "SABO_TEST_REDIS"
+
+// parseTarget splits host:port/db and refuses a missing or zero database.
+func parseTarget(v string) (addr string, db int, err error) {
+	i := strings.LastIndexByte(v, '/')
+	if i < 0 {
+		return "", 0, fmt.Errorf("%s=%q names no database; use host:port/15 (the database is flushed by every test)", Env, v)
+	}
+	db, err = strconv.Atoi(v[i+1:])
+	if err != nil || db <= 0 {
+		return "", 0, fmt.Errorf("%s=%q: database must be a number from 1 (0 is where real data usually lives, and it is flushed by every test)", Env, v)
+	}
+	return v[:i], db, nil
+}
 
 // R is a Redis for one test.
 type R struct {
@@ -26,17 +45,22 @@ type R struct {
 	Client *redis.Client
 	mini   *miniredis.Miniredis // nil on a real server
 	addr   string
+	db     int
 }
 
 // New returns a fresh, empty Redis for t.
 func New(t testing.TB) *R {
 	t.Helper()
 	r := &R{t: t}
-	if addr := os.Getenv(Env); addr != "" {
-		r.addr = addr
-		r.Client = redis.NewClient(&redis.Options{Addr: addr})
+	if v := os.Getenv(Env); v != "" {
+		addr, db, err := parseTarget(v)
+		if err != nil {
+			t.Fatal(err)
+		}
+		r.addr, r.db = addr, db
+		r.Client = redis.NewClient(&redis.Options{Addr: addr, DB: db})
 		if err := r.Client.FlushDB(context.Background()).Err(); err != nil {
-			t.Fatalf("real redis at %s: %v", addr, err)
+			t.Fatalf("real redis at %s db %d: %v", addr, db, err)
 		}
 	} else {
 		r.mini = miniredis.RunT(t)
@@ -50,8 +74,11 @@ func New(t testing.TB) *R {
 // Real reports whether this is a real server.
 func (r *R) Real() bool { return r.mini == nil }
 
-// Addr is the server address, for clients a test creates itself.
+// Addr is the server address, for clients a test creates itself (with Options).
 func (r *R) Addr() string { return r.addr }
+
+// Options returns client options for this Redis (address and database).
+func (r *R) Options() *redis.Options { return &redis.Options{Addr: r.addr, DB: r.db} }
 
 var bg = context.Background()
 

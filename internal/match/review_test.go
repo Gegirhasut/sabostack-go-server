@@ -6,8 +6,10 @@ package match
 import (
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"log/slog"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -142,5 +144,67 @@ func TestReviewMatchIsStoredBeforeItIsAnnounced(t *testing.T) {
 	}
 	if _, ok := all[id]; !ok {
 		t.Fatal("Create returned before the match's first snapshot was stored")
+	}
+}
+
+// gatedStore blocks its first write until the gate opens and records the order of all.
+type gatedStore struct {
+	plainStore
+	gate  chan struct{}
+	first sync.Once
+	mu    sync.Mutex
+	order []string
+}
+
+func (g *gatedStore) Save(ctx context.Context, id string, data []byte) error {
+	g.first.Do(func() { <-g.gate })
+	g.mu.Lock()
+	g.order = append(g.order, id)
+	g.mu.Unlock()
+	return g.plainStore.mem.Save(ctx, id, data)
+}
+
+// Fourth review, note 3: the first write that Create waits for went to the back of the
+// shard's queue, behind every periodic snapshot already waiting there, so a burst of
+// load slowed matchmaking down with the write queue. Writes someone waits for now go
+// first.
+func TestReviewAwaitedWriteSkipsTheQueue(t *testing.T) {
+	st := &gatedStore{plainStore: newPlain(), gate: make(chan struct{})}
+	opts := DefaultOptions()
+	opts.PersistWorkers, opts.PersistBatch = 1, 8 // one shard, small batches
+	mgr := NewManager(opts, clock.Real{}, st, metrics.New(prometheus.NewRegistry()), slog.New(slog.NewTextHandler(io.Discard, nil)))
+	defer mgr.Shutdown(context.Background())
+
+	mgr.save("in-flight", []byte("x"), false) // the writer is now stuck on this one
+	eventually(t, "writer busy", func() bool {
+		mgr.shards[0].mu.Lock()
+		defer mgr.shards[0].mu.Unlock()
+		return len(mgr.shards[0].pending) == 0
+	})
+	for i := 0; i < 200; i++ { // a backlog of routine snapshots
+		mgr.save(fmt.Sprintf("routine-%03d", i), []byte("x"), false)
+	}
+	done := make(chan struct{})
+	go func() { mgr.save("awaited", []byte("x"), true); close(done) }()
+	eventually(t, "awaited write queued", func() bool {
+		mgr.shards[0].mu.Lock()
+		defer mgr.shards[0].mu.Unlock()
+		_, ok := mgr.shards[0].pending["awaited"]
+		return ok
+	})
+	close(st.gate)
+	<-done
+
+	st.mu.Lock()
+	defer st.mu.Unlock()
+	pos := -1
+	for i, id := range st.order {
+		if id == "awaited" {
+			pos = i
+		}
+	}
+	// Written in the first batch after the one in flight, not after 200 routine writes.
+	if pos < 0 || pos > opts.PersistBatch {
+		t.Fatalf("awaited write was write #%d of %d", pos, len(st.order))
 	}
 }
