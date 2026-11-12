@@ -123,8 +123,20 @@ var ErrShuttingDown = errors.New("match: server shutting down")
 func (m *Manager) Create(names [2]string) (string, [2]string, error) {
 	id := randomID()
 	mt, tokens := New(id, m.opts.Match, names, randomSeed(), m.clock.Now())
-	if !m.start(mt) {
+	a := m.start(mt, true)
+	if a == nil {
 		return "", [2]string{}, ErrShuttingDown
+	}
+	// Announce the match only once its first snapshot is written. Before, players were
+	// told about it while the write was still queued: a resume reaching another node in
+	// that window found no owner and got match_not_found (final for the client), and a
+	// crash in that window lost a match the players had already been sent to. The wait
+	// is bounded by the store timeout; a failed write is retried by the actor.
+	<-a.stored
+	select {
+	case <-a.Done(): // stopped before it was announced (shutdown, or the store says another node owns it)
+		return "", [2]string{}, ErrStopped
+	default:
 	}
 	m.log.Info("match created", "match", id, "p0", names[0], "p1", names[1])
 	return id, tokens, nil
@@ -171,7 +183,7 @@ func (m *Manager) Restore(ctx context.Context) (int, error) {
 			_ = m.store.Delete(ctx, id)
 			continue
 		}
-		if !m.start(mt) {
+		if m.start(mt, false) == nil {
 			return n, ErrShuttingDown
 		}
 		n++
@@ -196,7 +208,7 @@ func (m *Manager) Adopt(snaps map[string][]byte) int {
 			m.enqueue(id, nil, false)
 			continue
 		}
-		if !m.start(mt) {
+		if m.start(mt, false) == nil {
 			return n
 		}
 		n++
@@ -263,12 +275,17 @@ func waitCtx(ctx context.Context, wait func()) error {
 	}
 }
 
-func (m *Manager) start(mt *Match) bool {
+// start runs an actor for mt; nil once the manager is shutting down. announce marks a
+// brand-new match whose first write the caller waits for (Actor.stored).
+func (m *Manager) start(mt *Match, announce bool) *Actor {
 	a := newActor(mt, m)
+	if announce {
+		a.stored = make(chan struct{})
+	}
 	m.mu.Lock()
 	if m.closed {
 		m.mu.Unlock()
-		return false
+		return nil
 	}
 	m.actors[mt.ID] = a
 	m.wg.Add(1)
@@ -288,7 +305,7 @@ func (m *Manager) start(mt *Match) bool {
 		m.mu.Unlock()
 		m.metrics.ActiveMatches.Dec()
 	}()
-	return true
+	return a
 }
 
 // matchFinished is called from the actor goroutine when its match reaches MatchEnd. The

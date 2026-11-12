@@ -6,6 +6,7 @@ package match
 import (
 	"context"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -164,19 +165,32 @@ func TestPersistMetrics(t *testing.T) {
 	}
 }
 
-type notOwnerStore struct{ plainStore }
+// notOwnerStore accepts a match's first write, then says another node owns it.
+type notOwnerStore struct {
+	plainStore
+	saves atomic.Int32
+}
 
-func (*notOwnerStore) Save(context.Context, string, []byte) error { return store.ErrNotOwner }
+func (s *notOwnerStore) Save(ctx context.Context, id string, data []byte) error {
+	if s.saves.Add(1) == 1 {
+		return s.plainStore.mem.Save(ctx, id, data)
+	}
+	return store.ErrNotOwner
+}
 
 // If another node owns the match, this node stops driving it (fencing).
 func TestNotOwnerEvictsActor(t *testing.T) {
 	clk := clock.NewFake(t0)
-	mgr := newTestManager(t, clk, &notOwnerStore{newPlain()})
+	mgr := newTestManager(t, clk, &notOwnerStore{plainStore: newPlain()})
 	defer mgr.Shutdown(context.Background())
-	id, tokens, _ := mgr.Create([2]string{"a", "b"})
+	id, tokens, err := mgr.Create([2]string{"a", "b"})
+	if err != nil {
+		t.Fatal(err)
+	}
 	a, _ := mgr.Get(id)
 	sink := &fakeSink{}
 	_, _ = a.Attach(context.Background(), tokens[0], sink, 0)
+	clk.Advance(time.Second) // the next snapshot is refused: another node owns the match
 	select {
 	case <-a.Done():
 	case <-time.After(5 * time.Second):

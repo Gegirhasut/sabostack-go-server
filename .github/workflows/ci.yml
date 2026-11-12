@@ -12,12 +12,15 @@ concurrency:
   group: ci-${{ github.ref }}
   cancel-in-progress: true
 
+# Third-party actions are pinned to a commit (the tag is in the comment), so a moved or
+# compromised tag cannot change what runs here. Dependabot keeps the pins current.
+
 jobs:
   lint:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-go@v5
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5.6.0
         with:
           go-version: stable
       - name: gofmt
@@ -39,19 +42,40 @@ jobs:
       matrix:
         go: ["1.25", stable] # the minimum from go.mod, and the current release
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-go@v5
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5.6.0
         with:
           go-version: ${{ matrix.go }}
       # Twice: the concurrency and cluster tests are timing-sensitive, a flake should
       # show up here rather than on a reviewer's machine.
       - run: go test -race -count=2 ./...
 
+  # The same store, cluster and server tests against a real Redis instead of miniredis:
+  # ownership, adoption and matchmaking live in Lua scripts, and miniredis does not
+  # reproduce real Redis everywhere (this job found a bug the fake hid). Packages run one
+  # at a time (-p 1) because each test flushes the shared server.
+  redis:
+    runs-on: ubuntu-latest
+    services:
+      redis:
+        image: redis:7
+        ports: ["6379:6379"]
+        options: >-
+          --health-cmd "redis-cli ping" --health-interval 2s --health-timeout 2s --health-retries 15
+    env:
+      SABO_TEST_REDIS: localhost:6379
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5.6.0
+        with:
+          go-version: stable
+      - run: go test -race -p 1 -count=2 ./internal/store ./internal/cluster ./internal/server
+
   fuzz:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-go@v5
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5.6.0
         with:
           go-version: stable
       - run: go test -run '^$' -fuzz '^FuzzDecodeState$' -fuzztime 30s ./internal/wire
@@ -60,7 +84,7 @@ jobs:
   docker:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
       - run: docker build -t sabostack-go-server .
       - name: smoke test
         run: |

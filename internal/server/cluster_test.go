@@ -10,7 +10,6 @@ import (
 	"testing"
 	"time"
 
-	"github.com/alicebob/miniredis/v2"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/redis/go-redis/v9"
 
@@ -20,9 +19,10 @@ import (
 	"github.com/Gegirhasut/sabostack-go-server/internal/metrics"
 	"github.com/Gegirhasut/sabostack-go-server/internal/protocol"
 	"github.com/Gegirhasut/sabostack-go-server/internal/store"
+	"github.com/Gegirhasut/sabostack-go-server/internal/testredis"
 )
 
-// clusterServer is one game server of a test cluster sharing a miniredis.
+// clusterServer is one game server of a test cluster sharing a Redis.
 type clusterServer struct {
 	name   string
 	url    string
@@ -32,7 +32,7 @@ type clusterServer struct {
 	cancel context.CancelFunc
 }
 
-func startClusterServer(t *testing.T, mr *miniredis.Miniredis, name string) *clusterServer {
+func startClusterServer(t *testing.T, mr *testredis.R, name string) *clusterServer {
 	t.Helper()
 	rdb := redis.NewClient(&redis.Options{Addr: mr.Addr()})
 	t.Cleanup(func() { rdb.Close() })
@@ -150,7 +150,7 @@ func waitAny(c *wsClient, types ...string) []byte {
 // crashes mid-round the other server adopts the match from its snapshot, both players
 // resume there and the match plays to the end.
 func TestClusterCrossNodeMatchSurvivesNodeCrash(t *testing.T) {
-	mr := miniredis.RunT(t)
+	mr := testredis.New(t)
 	a := startClusterServer(t, mr, "a")
 	b := startClusterServer(t, mr, "b")
 
@@ -215,7 +215,7 @@ func TestClusterCrossNodeMatchSurvivesNodeCrash(t *testing.T) {
 
 // A resume that reaches a server not running the match is redirected to its owner.
 func TestClusterResumeRedirect(t *testing.T) {
-	mr := miniredis.RunT(t)
+	mr := testredis.New(t)
 	a := startClusterServer(t, mr, "a")
 	b := startClusterServer(t, mr, "b")
 	alice0, bob0 := joinAnywhere(t, a.url, "alice"), joinAnywhere(t, a.url, "bob")

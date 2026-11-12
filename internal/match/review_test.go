@@ -114,3 +114,33 @@ func TestReviewFailedSnapshotIsRetried(t *testing.T) {
 		time.Sleep(2 * time.Millisecond)
 	}
 }
+
+// laggyStore takes its time with every write, like a remote Redis does.
+type laggyStore struct{ plainStore }
+
+func (s laggyStore) Save(ctx context.Context, id string, data []byte) error {
+	time.Sleep(50 * time.Millisecond)
+	return s.plainStore.mem.Save(ctx, id, data)
+}
+
+// Found by running the cluster tests against a real Redis (fourth review round): Create
+// returned, and players were told about the match, while its first snapshot (which also
+// records its owner) was still queued. A resume reaching another node in that window got
+// match_not_found, final for the client; a crash in it lost a match players had been
+// sent to. Create now returns only once the match is in the store.
+func TestReviewMatchIsStoredBeforeItIsAnnounced(t *testing.T) {
+	st := laggyStore{newPlain()}
+	mgr := NewManager(DefaultOptions(), clock.Real{}, st, metrics.New(prometheus.NewRegistry()), slog.New(slog.NewTextHandler(io.Discard, nil)))
+	defer mgr.Shutdown(context.Background())
+	id, _, err := mgr.Create([2]string{"a", "b"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	all, err := st.LoadAll(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := all[id]; !ok {
+		t.Fatal("Create returned before the match's first snapshot was stored")
+	}
+}

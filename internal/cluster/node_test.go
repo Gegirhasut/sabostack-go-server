@@ -7,14 +7,13 @@ import (
 	"testing"
 	"time"
 
-	"github.com/alicebob/miniredis/v2"
 	"github.com/prometheus/client_golang/prometheus"
-	"github.com/redis/go-redis/v9"
 
 	"github.com/Gegirhasut/sabostack-go-server/internal/clock"
 	"github.com/Gegirhasut/sabostack-go-server/internal/match"
 	"github.com/Gegirhasut/sabostack-go-server/internal/metrics"
 	"github.com/Gegirhasut/sabostack-go-server/internal/store"
+	"github.com/Gegirhasut/sabostack-go-server/internal/testredis"
 )
 
 func eventually(t *testing.T, what string, cond func() bool) {
@@ -30,8 +29,8 @@ func eventually(t *testing.T, what string, cond func() bool) {
 // longer prove it owns them). When Redis comes back and nobody adopted them, the node
 // brings them back from their snapshots instead of leaving them orphaned.
 func TestLeaseLossStopsAndRecoveryRestores(t *testing.T) {
-	mr := miniredis.RunT(t)
-	rdb := redis.NewClient(&redis.Options{Addr: mr.Addr()})
+	mr := testredis.New(t)
+	rdb := mr.Client
 	defer rdb.Close()
 	st := store.NewRedis(rdb, "n:", time.Hour).ForNode("a", "ws://a")
 	met := metrics.New(prometheus.NewRegistry())

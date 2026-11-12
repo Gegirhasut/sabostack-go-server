@@ -7,16 +7,15 @@ import (
 	"testing"
 	"time"
 
-	"github.com/alicebob/miniredis/v2"
-	"github.com/redis/go-redis/v9"
+	"github.com/Gegirhasut/sabostack-go-server/internal/testredis"
 )
 
 const lease = 10 * time.Second
 
-func clusterNodes(t *testing.T, names ...string) (*miniredis.Miniredis, map[string]*Redis) {
+func clusterNodes(t *testing.T, names ...string) (*testredis.R, map[string]*Redis) {
 	t.Helper()
-	mr := miniredis.RunT(t)
-	rdb := redis.NewClient(&redis.Options{Addr: mr.Addr()})
+	mr := testredis.New(t)
+	rdb := mr.Client
 	t.Cleanup(func() { rdb.Close() })
 	base := NewRedis(rdb, "c:", time.Hour)
 	nodes := map[string]*Redis{}

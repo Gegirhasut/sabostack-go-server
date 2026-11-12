@@ -10,14 +10,13 @@ import (
 	"testing"
 	"time"
 
-	"github.com/alicebob/miniredis/v2"
 	"github.com/prometheus/client_golang/prometheus"
-	"github.com/redis/go-redis/v9"
 
 	"github.com/Gegirhasut/sabostack-go-server/internal/clock"
 	"github.com/Gegirhasut/sabostack-go-server/internal/match"
 	"github.com/Gegirhasut/sabostack-go-server/internal/metrics"
 	"github.com/Gegirhasut/sabostack-go-server/internal/store"
+	"github.com/Gegirhasut/sabostack-go-server/internal/testredis"
 )
 
 // hangingCluster passes heartbeats through until hang is set, then lets them hang until
@@ -48,8 +47,8 @@ func (h *hangingCluster) Heartbeat(ctx context.Context, ttl time.Duration) error
 // expires (a lease after the last heartbeat was sent), so a match ran on two nodes for
 // several seconds and the moves made on the stale copy were lost.
 func TestReviewNodeFencesBeforeItsLeaseExpires(t *testing.T) {
-	mr := miniredis.RunT(t)
-	rdb := redis.NewClient(&redis.Options{Addr: mr.Addr()})
+	mr := testredis.New(t)
+	rdb := mr.Client
 	defer rdb.Close()
 	rs := store.NewRedis(rdb, "n:", time.Hour).ForNode("a", "ws://a")
 	met := metrics.New(prometheus.NewRegistry())
@@ -104,8 +103,8 @@ func (s *slowAdopter) AdoptOrphans(ctx context.Context, max int) (map[string][]b
 // 5 s, half the default lease) delayed heartbeats; the node's alive key could expire
 // while it was healthy, and other nodes would take over its matches.
 func TestReviewSlowAdoptionDoesNotDelayHeartbeats(t *testing.T) {
-	mr := miniredis.RunT(t)
-	rdb := redis.NewClient(&redis.Options{Addr: mr.Addr()})
+	mr := testredis.New(t)
+	rdb := mr.Client
 	defer rdb.Close()
 	rs := store.NewRedis(rdb, "n:", time.Hour).ForNode("a", "ws://a")
 	met := metrics.New(prometheus.NewRegistry())
@@ -219,8 +218,8 @@ func TestReviewLiveClaimerIsNotRequeuedDeadOneIs(t *testing.T) {
 // reconnecting to this node could join. Fencing and adoption now exclude each other, and
 // every failed heartbeat while fenced stops whatever is running.
 func TestReviewMatchStartedWhileFencedIsStopped(t *testing.T) {
-	mr := miniredis.RunT(t)
-	rdb := redis.NewClient(&redis.Options{Addr: mr.Addr()})
+	mr := testredis.New(t)
+	rdb := mr.Client
 	defer rdb.Close()
 	rs := store.NewRedis(rdb, "n:", time.Hour).ForNode("a", "ws://a")
 	met := metrics.New(prometheus.NewRegistry())

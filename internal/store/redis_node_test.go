@@ -6,13 +6,12 @@ import (
 	"testing"
 	"time"
 
-	"github.com/alicebob/miniredis/v2"
-	"github.com/redis/go-redis/v9"
+	"github.com/Gegirhasut/sabostack-go-server/internal/testredis"
 )
 
 func TestRedisNodeModeContract(t *testing.T) {
-	mr := miniredis.RunT(t)
-	rdb := redis.NewClient(&redis.Options{Addr: mr.Addr()})
+	mr := testredis.New(t)
+	rdb := mr.Client
 	defer rdb.Close()
 	testContract(t, NewRedis(rdb, "test:", time.Minute).ForNode("a", "wss://a.example/ws"))
 }
@@ -20,8 +19,8 @@ func TestRedisNodeModeContract(t *testing.T) {
 // Two servers sharing one Redis: each restores only its own matches, neither can write a
 // match the other owns, and either can tell a client where a match lives.
 func TestRedisNodeOwnership(t *testing.T) {
-	mr := miniredis.RunT(t)
-	rdb := redis.NewClient(&redis.Options{Addr: mr.Addr()})
+	mr := testredis.New(t)
+	rdb := mr.Client
 	defer rdb.Close()
 	ctx := context.Background()
 	base := NewRedis(rdb, "test:", time.Minute)
@@ -74,8 +73,8 @@ func TestRedisNodeOwnership(t *testing.T) {
 
 // Legacy mode keeps the single "<prefix>matches" set and no owner keys.
 func TestRedisLegacyHasNoDirectory(t *testing.T) {
-	mr := miniredis.RunT(t)
-	rdb := redis.NewClient(&redis.Options{Addr: mr.Addr()})
+	mr := testredis.New(t)
+	rdb := mr.Client
 	defer rdb.Close()
 	s := NewRedis(rdb, "test:", time.Minute)
 	ctx := context.Background()

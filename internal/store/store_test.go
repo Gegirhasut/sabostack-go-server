@@ -5,8 +5,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/alicebob/miniredis/v2"
-	"github.com/redis/go-redis/v9"
+	"github.com/Gegirhasut/sabostack-go-server/internal/testredis"
 )
 
 // Both implementations must satisfy the same contract.
@@ -40,8 +39,8 @@ func testContract(t *testing.T, s Store) {
 func TestMemory(t *testing.T) { testContract(t, NewMemory()) }
 
 func TestRedis(t *testing.T) {
-	mr := miniredis.RunT(t)
-	rdb := redis.NewClient(&redis.Options{Addr: mr.Addr()})
+	mr := testredis.New(t)
+	rdb := mr.Client
 	defer rdb.Close()
 	s := NewRedis(rdb, "test:", time.Minute)
 	testContract(t, s)

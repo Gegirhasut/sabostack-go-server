@@ -109,6 +109,12 @@ type Actor struct {
 	unsaved  atomic.Bool
 	finished bool // matchFinished ran (only touched by the actor goroutine)
 	deleted  <-chan struct{}
+
+	// stored is closed once a newly created match's first snapshot write has finished
+	// (or given up): Create waits for it before the match is announced. nil for matches
+	// that already exist in the store (restored, adopted).
+	stored     chan struct{}
+	storedOnce sync.Once
 }
 
 func newActor(m *Match, mgr *Manager) *Actor {
@@ -131,6 +137,7 @@ func (a *Actor) Done() <-chan struct{} { return a.done }
 
 func (a *Actor) run() {
 	defer close(a.done)
+	defer a.markStored() // never leave Create waiting, whatever happens
 	// A bug in one match must not take down the process and every other match on it.
 	defer func() {
 		if r := recover(); r != nil {
@@ -143,13 +150,16 @@ func (a *Actor) run() {
 	snapEvery := max(1, int(cfg.SnapshotEvery/cfg.Match.TickInterval))
 	ticks := 0
 	a.lastPhase = a.m.Phase
-	a.persist(clk.Now(), false) // a brand-new match is recoverable right away
+	// A brand-new match is recoverable (and, in a cluster, routable: the write records
+	// its owner) before anyone hears of it; Create waits for this write.
+	a.persist(clk.Now(), false, a.stored != nil)
+	a.markStored()
 
 	for {
 		select {
 		case <-a.stop:
 			if a.m.Phase != MatchEnd { // a finished match has nothing to resume
-				a.persist(clk.Now(), true)
+				a.persist(clk.Now(), true, true)
 			}
 			a.m.CloseSinks("server shutting down")
 			return
@@ -182,9 +192,15 @@ func (a *Actor) run() {
 				continue
 			}
 			if ticks%snapEvery == 0 && (a.m.Rev() != a.snapshotRev || a.unsaved.Load() || ticks%(snapEvery*forceSnapshotEvery) == 0) {
-				a.persist(now, false)
+				a.persist(now, false, false)
 			}
 		}
+	}
+}
+
+func (a *Actor) markStored() {
+	if a.stored != nil {
+		a.storedOnce.Do(func() { close(a.stored) })
 	}
 }
 
@@ -214,7 +230,7 @@ func (a *Actor) observe(now time.Time) {
 		a.deleted = a.mgr.matchFinished(a.m)
 		return
 	}
-	a.persist(now, false)
+	a.persist(now, false, false)
 }
 
 func (a *Actor) drainInputs(now time.Time) {
@@ -258,11 +274,11 @@ func (a *Actor) crashed(r any) {
 	}
 }
 
-// persist snapshots the match; sync (a graceful stop) waits for the write and marks the
-// snapshot final.
-func (a *Actor) persist(now time.Time, sync bool) {
+// persist snapshots the match. final (a graceful stop) marks the snapshot final; wait
+// blocks until the write is done.
+func (a *Actor) persist(now time.Time, final, wait bool) {
 	snap := a.m.Snapshot
-	if sync {
+	if final {
 		snap = a.m.FinalSnapshot
 	}
 	data, err := snap(now)
@@ -273,7 +289,7 @@ func (a *Actor) persist(now time.Time, sync bool) {
 	a.snapshotRev = a.m.Rev()
 	a.unsaved.Store(false)
 	a.mgr.metrics.SnapshotBytes.Observe(float64(len(data)))
-	a.mgr.save(a.id, data, sync)
+	a.mgr.save(a.id, data, wait)
 }
 
 // send queues f for the actor goroutine, blocking until it is accepted.

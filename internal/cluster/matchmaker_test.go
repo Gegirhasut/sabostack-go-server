@@ -9,16 +9,16 @@ import (
 	"testing"
 	"time"
 
-	"github.com/alicebob/miniredis/v2"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/redis/go-redis/v9"
 
 	"github.com/Gegirhasut/sabostack-go-server/internal/lobby"
 	"github.com/Gegirhasut/sabostack-go-server/internal/metrics"
+	"github.com/Gegirhasut/sabostack-go-server/internal/testredis"
 )
 
 type mmEnv struct {
-	mr  *miniredis.Miniredis
+	mr  *testredis.R
 	rdb *redis.Client
 	mu  sync.Mutex
 	// matches created, by hosting node
@@ -27,8 +27,8 @@ type mmEnv struct {
 
 func newEnv(t *testing.T) *mmEnv {
 	t.Helper()
-	mr := miniredis.RunT(t)
-	rdb := redis.NewClient(&redis.Options{Addr: mr.Addr()})
+	mr := testredis.New(t)
+	rdb := mr.Client
 	t.Cleanup(func() { rdb.Close() })
 	return &mmEnv{mr: mr, rdb: rdb, created: map[string][][2]string{}}
 }
