@@ -7,9 +7,8 @@
 восстановление после падения процесса и кластер из нескольких узлов, который переживает
 смерть узла посреди игры.
 
-Он повторяет игровой цикл
-**[SaboStack](https://play.google.com/store/apps/details?id=com.sabostack.app)** — моей
-real-time PvP-игры для браузера и Android, опубликованной в Google Play (5K+ скачиваний).
+Это сервер **[SaboStack](https://play.google.com/store/apps/details?id=com.sabostack.app)** —
+моей real-time PvP-игры для браузера и Android, опубликованной в Google Play (5K+ скачиваний).
 
 ## Коротко в цифрах
 
