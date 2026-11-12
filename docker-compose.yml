@@ -1,0 +1,24 @@
+services:
+  redis:
+    image: redis:7-alpine
+    command: ["redis-server", "--save", "", "--appendonly", "no"]
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 2s
+      timeout: 2s
+      retries: 10
+
+  server:
+    build: .
+    environment:
+      ADDR: ":8080"
+      REDIS_ADDR: "redis:6379"
+    ports:
+      - "8080:8080"
+    depends_on:
+      redis:
+        condition: service_healthy
+    # SIGTERM triggers the graceful shutdown that snapshots every live match to Redis;
+    # give it time to finish before Docker sends SIGKILL.
+    stop_grace_period: 20s
+    restart: unless-stopped
