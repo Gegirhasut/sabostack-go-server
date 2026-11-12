@@ -320,3 +320,15 @@ func TestReviewSnapshotMigrationFromPreviousVersion(t *testing.T) {
 		t.Fatalf("restore through migration: err=%v called=%v", err, called)
 	}
 }
+
+// Eighth review: unknown versions are kept, but a node with a stable id (a StatefulSet
+// pod) that comes back on a new snapshot version still owns its old-format matches and
+// cannot run them; nobody else takes them while it is alive. So bumping the version
+// without a migration from the previous one loses those matches in practice. This test
+// turns the rule from a comment into a failing build.
+func TestSnapshotMigrationExistsForPreviousVersion(t *testing.T) {
+	if snapshotVersion > 1 && !supportedVersion(snapshotVersion-1) {
+		t.Fatalf("snapshotVersion bumped to %d without a migration from %d: register snapshotMigrations[%d]",
+			snapshotVersion, snapshotVersion-1, snapshotVersion-1)
+	}
+}

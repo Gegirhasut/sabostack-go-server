@@ -22,7 +22,7 @@ type Options struct {
 	AdoptBatch int           // most matches adopted per scan, so a dead node's load spreads
 }
 
-// DefaultOptions: a crashed node's matches resume elsewhere within about Lease +
+// DefaultOptions returns the production timings: a crashed node's matches resume elsewhere within about Lease +
 // AdoptEvery (≈ 12 s), inside the 20 s reconnect grace. AdoptBatch is small on purpose:
 // one survivor taking every match of a dead node at once would double its load, while
 // batches spread them over the live nodes, one scan (2 s) apart.

@@ -46,8 +46,6 @@ func NewRedis(rdb redis.UniversalClient, prefix string, ttl time.Duration) *Redi
 	return &Redis{rdb: rdb, prefix: prefix, ttl: ttl}
 }
 
-// ForNode returns a copy of s in node mode: matches are owned by node, and clients that
-// reach another server are redirected to publicURL.
 // ValidateNode checks a node id and public URL before they are written into Redis. The
 // owner value is "<node> <url>" and matchmaking tickets are tab-separated, so whitespace
 // in either would make other nodes misread them; ids are also used inside key names.
@@ -66,6 +64,8 @@ func ValidateNode(node, publicURL string) error {
 	return nil
 }
 
+// ForNode returns a copy of s in node mode: matches are owned by node, and clients that
+// reach another server are redirected to publicURL.
 func (s *Redis) ForNode(node, publicURL string) *Redis {
 	c := *s
 	c.node, c.url = node, publicURL

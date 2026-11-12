@@ -87,14 +87,18 @@ type persistShard struct {
 	// behind thousands of routine writes. An id may be in both lists; whichever list
 	// reaches it first writes it.
 	urgent []string
-	closed bool
-	wake   chan struct{}
+	// urgentPending counts the pending jobs that are urgent, so the writer can tell
+	// whether routine jobs wait too without walking the lists.
+	urgentPending int
+	closed        bool
+	wake          chan struct{}
 }
 
 type persistJob struct {
 	id      string
 	data    []byte // nil = delete
 	waiters []chan struct{}
+	urgent  bool // someone waits for it; counted in persistShard.urgentPending
 }
 
 // NewManager starts the persistence goroutines. Call Shutdown to stop everything.
@@ -430,7 +434,9 @@ func (m *Manager) enqueue(id string, data []byte, wait bool) <-chan struct{} {
 		sh.order = append(sh.order, id)
 		m.metrics.PersistPending.Inc()
 	}
-	if done != nil {
+	if j := sh.pending[id]; done != nil && !j.urgent {
+		j.urgent = true
+		sh.urgentPending++
 		sh.urgent = append(sh.urgent, id)
 	}
 	sh.mu.Unlock()
@@ -441,13 +447,7 @@ func (m *Manager) enqueue(id string, data []byte, wait bool) <-chan struct{} {
 // routineWaiting reports whether any pending job is not urgent. (Every job is also in
 // order, urgent ones included, so len(order) alone says nothing.) Called with sh.mu held.
 func (sh *persistShard) routineWaiting() bool {
-	urgent := make(map[string]struct{}, len(sh.urgent))
-	for _, id := range sh.urgent {
-		if _, ok := sh.pending[id]; ok {
-			urgent[id] = struct{}{}
-		}
-	}
-	return len(sh.pending) > len(urgent)
+	return len(sh.pending) > sh.urgentPending
 }
 
 // take moves pending jobs from the front of queue into jobs until it holds max, and
@@ -459,6 +459,9 @@ func (sh *persistShard) take(queue []string, jobs *[]*persistJob, max int) []str
 		if j, ok := sh.pending[queue[i]]; ok {
 			*jobs = append(*jobs, j)
 			delete(sh.pending, queue[i])
+			if j.urgent {
+				sh.urgentPending--
+			}
 		}
 	}
 	if i == len(queue) {

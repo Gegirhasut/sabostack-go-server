@@ -18,7 +18,7 @@ const snapshotVersion = 1
 // a node of the right version may still need it.
 var snapshotMigrations = map[int]func(json.RawMessage) (json.RawMessage, error){}
 
-// ErrSnapshotVersion: the snapshot was written in a format this build cannot run.
+// ErrSnapshotVersion means the snapshot was written in a format this build cannot run.
 var ErrSnapshotVersion = errors.New("match: unsupported snapshot version")
 
 // SnapshotSupported reports whether this build can run a match from data's format. It
