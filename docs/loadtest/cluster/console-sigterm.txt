@@ -1,0 +1,32 @@
+=== 2026-11-12T21:59:49Z stopping game-2 (SIGTERM)
+ Container sabostack-go-server-game-2-1 Killed 
+=== bot report
+bots:               600 (300 pairs)
+ramp / measured:    1.5s / 60.0s
+matches finished:   877
+errors / dropped:   0 / 0
+violations:         0
+cross-server:       973 redirects; drops resumed 206, lost 0; drop->resumed p50=3838ms p95=3901ms max=3906ms
+inputs sent:        87750
+messages received:  162857 (2714/s, 7.6 MB); inputs sent: 0.3 MB (bin)
+input->ack latency: p50=26.2ms p95=48.3ms p99=50.4ms max=4087.7ms (n=87776)
+server connections: avg 587, min 464; live matches avg 292 (425 incl. lingering)
+server CPU:         81.4% of one core
+server RSS:         avg 105.6 MB, max 122.3 MB (start 104.6, end 93.9)
+server goroutines:  avg 2235 (start 2157, end 2208)
+server tick:        mean 3.0µs, max 16.07ms
+server traffic:     0.17 KB/s out, 0.01 KB/s in per client
+=== invariant violations reported by bots: 0
+=== takeover on the surviving nodes
+{"time":"2026-11-12T21:59:01.270266541Z","level":"INFO","msg":"cluster mode","node":"game-3","url":"ws://game-3:8080/ws","lease":10000000000,"sharedQueue":true}
+{"time":"2026-11-12T21:59:01.704358727Z","level":"INFO","msg":"cluster mode","node":"game-1","url":"ws://game-1:8080/ws","lease":10000000000,"sharedQueue":true}
+{"time":"2026-11-12T21:59:51.713368262Z","level":"INFO","msg":"adopted matches from dead nodes","count":50}
+{"time":"2026-11-12T21:59:51.281648364Z","level":"INFO","msg":"adopted matches from dead nodes","count":50}
+{"time":"2026-11-12T21:59:53.269871242Z","level":"INFO","msg":"adopted matches from dead nodes","count":3}
+matches adopted per node:
+  game-1: 50
+  game-3: 53
+=== shutdown of game-2
+{"time":"2026-11-12T21:59:02.154775527Z","level":"INFO","msg":"cluster mode","node":"game-2","url":"ws://game-2:8080/ws","lease":10000000000,"sharedQueue":true}
+{"time":"2026-11-12T21:59:49.869291976Z","level":"INFO","msg":"shutting down: snapshotting matches"}
+{"time":"2026-11-12T21:59:49.891975814Z","level":"INFO","msg":"shutdown complete"}

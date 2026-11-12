@@ -424,6 +424,7 @@ func (m *Manager) write(jobs []*persistJob) {
 	if m.breakerOpen() {
 		for _, j := range jobs {
 			m.metrics.SnapshotWrites.WithLabelValues(opName(j.data), "skipped").Inc()
+			m.markUnsaved(j)
 		}
 		return
 	}
@@ -458,6 +459,7 @@ func (m *Manager) write(jobs []*persistJob) {
 		case err != nil:
 			result = "error"
 			failed++
+			m.markUnsaved(jobs[i])
 			if firstErr == nil {
 				firstErr = err
 			}
@@ -488,6 +490,17 @@ func (m *Manager) breakerRecord(allFailed bool) {
 		m.failStreak = 0
 		m.breakerUntil = time.Now().Add(breakerCooldown)
 		m.log.Warn("snapshot store circuit open: skipping writes", "for", breakerCooldown)
+	}
+}
+
+// markUnsaved makes the match write its snapshot again on its next snapshot tick: the
+// store does not have this version. A failed delete needs nothing: the match is over.
+func (m *Manager) markUnsaved(j *persistJob) {
+	if j.data == nil {
+		return
+	}
+	if a, ok := m.Get(j.id); ok {
+		a.unsaved.Store(true)
 	}
 }
 

@@ -59,7 +59,7 @@ func main() {
 	flag.StringVar(&c.origins, "allowed-origins", os.Getenv("ALLOWED_ORIGINS"), "comma-separated browser Origin hosts to accept (empty = any)")
 	flag.IntVar(&c.srv.MaxConns, "max-conns", 0, "max open WebSockets per process (0 = unlimited)")
 	flag.IntVar(&c.srv.MaxConnsPerIP, "max-conns-per-ip", 0, "max open WebSockets per client IP (0 = unlimited)")
-	flag.BoolVar(&c.srv.TrustProxy, "trust-proxy", false, "take the client IP from X-Forwarded-For (only behind a trusted proxy)")
+	flag.IntVar(&c.srv.TrustedProxies, "trusted-proxies", envInt("TRUSTED_PROXIES", 0), "number of our reverse proxies in front of the server; the client IP is that many X-Forwarded-For entries from the right (0 = ignore X-Forwarded-For)")
 	flag.Float64Var(&c.srv.InputRate, "input-rate", c.srv.InputRate, "client messages per second per connection (0 = unlimited)")
 	flag.Float64Var(&c.srv.InputBurst, "input-burst", c.srv.InputBurst, "burst allowance for -input-rate")
 	flag.DurationVar(&c.srv.PingInterval, "ping-interval", c.srv.PingInterval, "server WebSocket ping interval")
@@ -125,8 +125,15 @@ func run(log *slog.Logger, c config) error {
 	} else {
 		log.Warn("using in-memory snapshot store: matches will not survive a restart")
 	}
+	// Defaults suit local runs and single-IP load tests; say so loudly in production logs.
 	if len(c.srv.AllowedOrigins) == 0 {
 		log.Warn("accepting WebSocket upgrades from any Origin (set -allowed-origins in production)")
+	}
+	if c.srv.MaxConnsPerIP == 0 {
+		log.Warn("no per-IP connection limit (set -max-conns-per-ip, plus -trusted-proxies behind a load balancer)")
+	}
+	if c.srv.PublicMetrics {
+		log.Warn("/metrics is served on the public address (set -admin-addr and -public-metrics=false in production)")
 	}
 
 	mgr := match.NewManager(c.opts, clock.Real{}, st, met, log)
@@ -198,6 +205,13 @@ func run(log *slog.Logger, c config) error {
 	log.Info("shutting down: snapshotting matches")
 	shutdownCtx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancel()
+	if node != nil {
+		// Before the sockets close: players reconnecting to other nodes must be told to
+		// retry, not be redirected back here.
+		if err := node.Leaving(shutdownCtx); err != nil {
+			log.Warn("cluster leaving", "err", err)
+		}
+	}
 	if err := httpSrv.Shutdown(shutdownCtx); err != nil && !errors.Is(err, http.ErrServerClosed) {
 		log.Error("http shutdown", "err", err)
 	}
@@ -246,6 +260,13 @@ func envBool(key string, def bool) bool {
 
 func envDuration(key string, def time.Duration) time.Duration {
 	if v, err := time.ParseDuration(os.Getenv(key)); err == nil {
+		return v
+	}
+	return def
+}
+
+func envInt(key string, def int) int {
+	if v, err := strconv.Atoi(os.Getenv(key)); err == nil {
 		return v
 	}
 	return def

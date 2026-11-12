@@ -169,9 +169,11 @@ func (m *Match) Attach(token string, sink Sink, lastEventSeq uint64, now time.Ti
 		s.AwayUsed += now.Sub(later(s.LeftAt, m.PausedAt))
 	}
 	s.Connected, s.LeftAt = true, time.Time{}
-	if m.Phase == Playing {
-		s.LastInput = now // don't count time away as idle
-	}
+	// LastInput is deliberately left alone. Time away is not idle time, but that is
+	// already handled: being away pauses the match and the end of the pause shifts every
+	// LastInput by the pause length (checkPause). Resetting it here as well gave a free
+	// pause-length of idle credit per reconnect, and let a player who never moved dodge
+	// the idle forfeit by opening a new socket every so often.
 	if wasAway && m.Phase != Waiting && m.Phase != MatchEnd {
 		m.emit(now, protocol.Event{Kind: protocol.EvPlayerBack, Seat: intp(seat)})
 	}

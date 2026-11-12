@@ -6,6 +6,7 @@ import (
 	"log/slog"
 	"runtime/debug"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/Gegirhasut/sabostack-go-server/internal/game"
@@ -102,8 +103,12 @@ type Actor struct {
 	done        chan struct{} // closed when the goroutine exits
 	lastPhase   Phase
 	snapshotRev uint64 // Match.Rev at the last snapshot
-	finished    bool   // matchFinished ran (only touched by the actor goroutine)
-	deleted     <-chan struct{}
+	// unsaved is set by the persister when a snapshot write failed or was skipped by the
+	// circuit breaker: the next snapshot tick writes again even if the match did not
+	// change, instead of waiting for the forced re-snapshot.
+	unsaved  atomic.Bool
+	finished bool // matchFinished ran (only touched by the actor goroutine)
+	deleted  <-chan struct{}
 }
 
 func newActor(m *Match, mgr *Manager) *Actor {
@@ -176,7 +181,7 @@ func (a *Actor) run() {
 				}
 				continue
 			}
-			if ticks%snapEvery == 0 && (a.m.Rev() != a.snapshotRev || ticks%(snapEvery*forceSnapshotEvery) == 0) {
+			if ticks%snapEvery == 0 && (a.m.Rev() != a.snapshotRev || a.unsaved.Load() || ticks%(snapEvery*forceSnapshotEvery) == 0) {
 				a.persist(now, false)
 			}
 		}
@@ -266,6 +271,7 @@ func (a *Actor) persist(now time.Time, sync bool) {
 		return
 	}
 	a.snapshotRev = a.m.Rev()
+	a.unsaved.Store(false)
 	a.mgr.metrics.SnapshotBytes.Observe(float64(len(data)))
 	a.mgr.save(a.id, data, sync)
 }

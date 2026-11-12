@@ -27,10 +27,20 @@ import (
 //     through a Redis pub/sub channel per node. A player connected to another node gets
 //     "matched" with the url of the hosting node, reconnects there and resumes.
 //
-// Pub/sub is at most once. If an assignment is lost (a node's subscription dropped, or the
-// popping node died between pop and publish), the waiting node notices that its ticket is
-// neither queued nor assigned and pushes it again; the orphaned match ends with
-// opponent_never_joined.
+// Pub/sub is at most once, so it is only the fast path. The pair script also records a
+// claim per ticket ("node X popped it"), and the popping node writes each remote
+// assignment to Redis before publishing it. A waiting node whose ticket left the queue but
+// got no message looks there:
+//
+//   - an assignment is recorded: the message was lost or is late; deliver the record;
+//   - the claimer is alive and still working: wait, however slow it is;
+//   - the claimer is dead (or its claim expired) and nothing was recorded: the match was
+//     never announced, so the ticket goes back into the queue.
+//
+// A ticket is therefore requeued only when no assignment can still arrive, and a player
+// is never put into two matches because a message was slow. (Before, any ticket missing
+// for 3 s was requeued; a late message then left one of the two matches waiting for a
+// player who never came.)
 type Matchmaker struct {
 	rdb    redis.UniversalClient
 	prefix string
@@ -51,6 +61,7 @@ type Matchmaker struct {
 }
 
 type waiter struct {
+	id           string
 	t            *lobby.Ticket
 	raw          string
 	missingSince time.Time // popped but not assigned yet; zero while queued
@@ -69,11 +80,14 @@ type assignMsg struct {
 // Timings (variables so tests can shorten them).
 var (
 	pollEvery      = 200 * time.Millisecond
-	requeueAfter   = 3 * time.Second // popped, no assignment: assume it was lost
+	requeueAfter   = 3 * time.Second // popped, unclaimed or claimer dead, nothing recorded
 	checkLostEvery = time.Second
+	claimTTL       = 30 * time.Second // a live popper that has not announced by then failed
+	assignTTL      = time.Minute
 )
 
-// KEYS: queue. ARGV: alive key prefix. Pops the two oldest tickets whose node is alive.
+// KEYS: queue. ARGV: alive key prefix, claim key prefix, this node, claim ttl ms. Pops the
+// two oldest tickets whose node is alive and claims them for this node.
 var pairScript = redis.NewScript(`
 local function alive(raw)
   local a = string.find(raw, '\t', 1, true)
@@ -91,6 +105,10 @@ end
 if #picked == 1 then
   redis.call('LPUSH', KEYS[1], picked[1])
   return {}
+end
+for _, raw in ipairs(picked) do
+  local a = string.find(raw, '\t', 1, true)
+  redis.call('SET', ARGV[2] .. string.sub(raw, 1, a - 1), ARGV[3], 'PX', ARGV[4])
 end
 return picked
 `)
@@ -119,6 +137,8 @@ func NewMatchmaker(rdb redis.UniversalClient, prefix, node, url string, create l
 func (m *Matchmaker) queueKey() string           { return m.prefix + "mm:queue" }
 func (m *Matchmaker) channel(node string) string { return m.prefix + "mm:to:" + node }
 func (m *Matchmaker) alivePrefix() string        { return m.prefix + "alive:" }
+func (m *Matchmaker) claimKey(id string) string  { return m.prefix + "mm:claim:" + id }
+func (m *Matchmaker) assignKey(id string) string { return m.prefix + "mm:assign:" + id }
 
 func ticketID() string {
 	var b [12]byte
@@ -130,7 +150,7 @@ func ticketID() string {
 func (m *Matchmaker) JoinContext(ctx context.Context, name string) *lobby.Ticket {
 	t := lobby.NewTicket(ctx, name)
 	id := ticketID()
-	w := &waiter{t: t, raw: id + "\t" + m.node + "\t" + name}
+	w := &waiter{id: id, t: t, raw: id + "\t" + m.node + "\t" + name}
 	m.mu.Lock()
 	if m.closed {
 		m.mu.Unlock()
@@ -221,7 +241,8 @@ func (m *Matchmaker) tryPair(ctx context.Context) {
 		if closed {
 			return
 		}
-		pair, err := pairScript.Run(ctx, m.rdb, []string{m.queueKey()}, m.alivePrefix()).StringSlice()
+		pair, err := pairScript.Run(ctx, m.rdb, []string{m.queueKey()},
+			m.alivePrefix(), m.claimKey(""), m.node, claimTTL.Milliseconds()).StringSlice()
 		if err != nil {
 			if !errors.Is(err, redis.Nil) {
 				m.met.ClusterErrors.WithLabelValues("pair").Inc()
@@ -257,6 +278,7 @@ func (m *Matchmaker) start(ctx context.Context, pair []string) {
 	if err != nil {
 		// Cannot host (shutting down): give the pair back, oldest first, to another node.
 		m.rdb.LPush(ctx, m.queueKey(), pair[1], pair[0])
+		m.rdb.Del(ctx, m.claimKey(a.id), m.claimKey(b.id))
 		return
 	}
 	for seat, t := range []ticket{a, b} {
@@ -270,7 +292,13 @@ func (m *Matchmaker) start(ctx context.Context, pair []string) {
 		as.URL = m.url
 		m.met.Matchmaking.WithLabelValues("remote").Inc()
 		body, _ := json.Marshal(as)
-		if err := m.rdb.Publish(ctx, m.channel(t.node), body).Err(); err != nil {
+		// Record first, then publish: if the message is lost, the record is still there.
+		_, err := m.rdb.TxPipelined(ctx, func(p redis.Pipeliner) error {
+			p.Set(ctx, m.assignKey(t.id), body, assignTTL)
+			p.Publish(ctx, m.channel(t.node), body)
+			return nil
+		})
+		if err != nil {
 			m.met.ClusterErrors.WithLabelValues("publish").Inc()
 		}
 	}
@@ -342,14 +370,62 @@ func (m *Matchmaker) requeueLost() {
 		case err == nil: // still queued
 			m.setMissing(w, time.Time{})
 		case errors.Is(err, redis.Nil):
+			if m.popped(ctx, w) != poppedLost {
+				m.setMissing(w, time.Time{})
+				continue
+			}
 			since := m.setMissing(w, now)
 			if now.Sub(since) >= requeueAfter && m.stillWaiting(w) {
 				m.met.Matchmaking.WithLabelValues("requeued").Inc()
+				m.rdb.Del(ctx, m.claimKey(w.id))
 				m.rdb.RPush(ctx, m.queueKey(), w.raw)
 				m.setMissing(w, time.Time{})
 			}
 		}
 	}
+}
+
+type poppedState int
+
+const (
+	poppedLost     poppedState = iota // nobody will announce it: requeue (after requeueAfter)
+	poppedAssigned                    // the assignment was recorded, and is now delivered
+	poppedPending                     // a live node claimed it and is still working
+	poppedUnknown                     // Redis did not answer: decide next time
+)
+
+// popped finds out what happened to a ticket that left the queue without its assignment
+// reaching this node.
+func (m *Matchmaker) popped(ctx context.Context, w *waiter) poppedState {
+	var assign, claim *redis.StringCmd
+	_, err := m.rdb.Pipelined(ctx, func(p redis.Pipeliner) error {
+		assign = p.Get(ctx, m.assignKey(w.id))
+		claim = p.Get(ctx, m.claimKey(w.id))
+		return nil
+	})
+	if err != nil && !errors.Is(err, redis.Nil) {
+		return poppedUnknown
+	}
+	if body, err := assign.Bytes(); err == nil {
+		var as assignMsg
+		if json.Unmarshal(body, &as) == nil {
+			m.met.Matchmaking.WithLabelValues("recovered").Inc()
+			m.deliver(as)
+			return poppedAssigned
+		}
+	}
+	claimer, err := claim.Result()
+	if err != nil {
+		return poppedLost // never claimed, or the claim expired
+	}
+	alive, err := m.rdb.Exists(ctx, m.alivePrefix()+claimer).Result()
+	switch {
+	case err != nil:
+		return poppedUnknown
+	case alive == 1:
+		return poppedPending
+	}
+	return poppedLost
 }
 
 func (m *Matchmaker) forgetTicket(w *waiter) {

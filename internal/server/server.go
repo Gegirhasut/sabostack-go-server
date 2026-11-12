@@ -34,9 +34,12 @@ type Config struct {
 	// Empty accepts any origin. Requests without an Origin header (native apps) are
 	// always accepted.
 	AllowedOrigins []string
-	MaxConns       int  // open WebSockets per process; 0 = unlimited
-	MaxConnsPerIP  int  // open WebSockets per client IP; 0 = unlimited
-	TrustProxy     bool // take the client IP from X-Forwarded-For (only behind a trusted proxy)
+	MaxConns       int // open WebSockets per process; 0 = unlimited
+	MaxConnsPerIP  int // open WebSockets per client IP; 0 = unlimited
+	// TrustedProxies is how many reverse proxies of ours stand in front of the server
+	// (0 = none: X-Forwarded-For is ignored). The client IP is then the address the
+	// outermost of them saw: the TrustedProxies-th entry of X-Forwarded-For from the right.
+	TrustedProxies int
 
 	HelloTimeout time.Duration // first message (join/resume) must arrive within this
 	PingInterval time.Duration // server ping frames
@@ -240,11 +243,24 @@ func (s *Server) Shutdown(ctx context.Context) error {
 	return err
 }
 
+// clientIP returns the address connection limits are keyed by.
+//
+// X-Forwarded-For is read from the right. Every proxy appends the address it received the
+// request from, so only the last TrustedProxies entries were written by our proxies;
+// everything to the left of them came from the client and is free to forge. (Taking the
+// first entry, as before, let a client pick any IP it liked and bypass -max-conns-per-ip.)
 func (s *Server) clientIP(r *http.Request) string {
-	if s.cfg.TrustProxy {
-		if xff := r.Header.Get("X-Forwarded-For"); xff != "" {
-			first, _, _ := strings.Cut(xff, ",")
-			return strings.TrimSpace(first)
+	if n := s.cfg.TrustedProxies; n > 0 {
+		var hops []string
+		for _, v := range r.Header.Values("X-Forwarded-For") {
+			hops = append(hops, strings.Split(v, ",")...)
+		}
+		if len(hops) > 0 {
+			// Fewer entries than proxies: the client added none, the leftmost is real.
+			hop := strings.TrimSpace(hops[max(0, len(hops)-n)])
+			if ip := net.ParseIP(hop); ip != nil {
+				return ip.String()
+			}
 		}
 	}
 	host, _, err := net.SplitHostPort(r.RemoteAddr)
@@ -392,9 +408,14 @@ func (s *Server) joinQueue(c *client, in <-chan protocol.ClientMsg, hello protoc
 		select {
 		case a = <-ticket.C():
 			waiting = false
-		case _, ok := <-in:
+		case msg, ok := <-in:
 			if ok {
-				continue // nothing to do while queued; ignore
+				// Nothing else to do while queued, but a client measuring latency (or
+				// checking the link is alive) still gets its pong.
+				if msg.Type == protocol.TypePing {
+					c.Send(protocol.Pong{Type: protocol.TypePong, T: msg.T})
+				}
+				continue
 			}
 			if s.queue.Leave(ticket) {
 				return nil, 0, errors.New("left queue")

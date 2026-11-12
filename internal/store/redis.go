@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	"github.com/redis/go-redis/v9"
@@ -29,6 +30,9 @@ type Redis struct {
 	ttl    time.Duration
 	node   string // empty = legacy single-node mode
 	url    string // this node's public WebSocket URL, for redirects
+	// leaving is set by Leaving: this node is shutting down and must not be advertised
+	// as a redirect target any more (shared by the copies ForNode hands out).
+	leaving *atomic.Bool
 }
 
 // NewRedis wraps a client in legacy single-node mode. ttl bounds how long an orphaned
@@ -42,6 +46,7 @@ func NewRedis(rdb redis.UniversalClient, prefix string, ttl time.Duration) *Redi
 func (s *Redis) ForNode(node, publicURL string) *Redis {
 	c := *s
 	c.node, c.url = node, publicURL
+	c.leaving = new(atomic.Bool)
 	return &c
 }
 
@@ -232,15 +237,17 @@ func (s *Redis) Owner(ctx context.Context, id string) (node, url string, ok bool
 		return "", "", false, err
 	}
 	node, url, _ = strings.Cut(v, " ")
-	var alive *redis.IntCmd
+	var alive *redis.StringCmd
 	var isMember *redis.BoolCmd
 	_, err = s.rdb.Pipelined(ctx, func(p redis.Pipeliner) error {
-		alive = p.Exists(ctx, s.aliveKey(node))
+		alive = p.Get(ctx, s.aliveKey(node))
 		isMember = p.SIsMember(ctx, s.nodesKey(), node)
 		return nil
 	})
-	if err == nil && isMember.Val() && alive.Val() == 0 {
-		url = "" // dead member: the match is moving
+	if (err == nil || errors.Is(err, redis.Nil)) && isMember.Val() {
+		if v, aerr := alive.Result(); errors.Is(aerr, redis.Nil) || (aerr == nil && v == leavingMark) {
+			url = "" // dead or shutting down: the match is moving
+		}
 	}
 	return node, url, true, nil
 }

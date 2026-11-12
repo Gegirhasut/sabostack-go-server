@@ -17,9 +17,30 @@ type Cluster interface {
 	// AdoptOrphans moves up to max matches of dead nodes to this node and returns their
 	// snapshots. Every match is adopted by exactly one node.
 	AdoptOrphans(ctx context.Context, max int) (map[string][]byte, error)
+	// Leaving announces that this node is shutting down: it stays alive (nobody adopts
+	// its matches while it writes their final snapshots), but other nodes stop sending
+	// players to it and answer "match_moving" instead.
+	Leaving(ctx context.Context) error
 	// Release ends this node's heartbeat at once, so after a graceful shutdown (final
 	// snapshots written) the other nodes adopt its matches without waiting for the ttl.
 	Release(ctx context.Context) error
+}
+
+// leavingMark is the alive key's value while its node shuts down (normally it holds the
+// node's URL).
+const leavingMark = "-leaving-"
+
+// Leaving implements Cluster.
+func (s *Redis) Leaving(ctx context.Context) error {
+	if s.node == "" {
+		return nil
+	}
+	s.leaving.Store(true) // later heartbeats keep the mark
+	err := s.rdb.SetArgs(ctx, s.aliveKey(s.node), leavingMark, redis.SetArgs{KeepTTL: true, Mode: "XX"}).Err()
+	if errors.Is(err, redis.Nil) {
+		return nil // the key had already expired: the node already counts as dead
+	}
+	return err
 }
 
 // Release implements Cluster.
@@ -47,7 +68,11 @@ func (s *Redis) Heartbeat(ctx context.Context, ttl time.Duration) error {
 		return errors.New("store: heartbeat needs node mode")
 	}
 	_, err := s.rdb.Pipelined(ctx, func(p redis.Pipeliner) error {
-		p.Set(ctx, s.aliveKey(s.node), s.url, ttl)
+		v := s.url
+		if s.leaving.Load() {
+			v = leavingMark
+		}
+		p.Set(ctx, s.aliveKey(s.node), v, ttl)
 		p.SAdd(ctx, s.nodesKey(), s.node)
 		return nil
 	})

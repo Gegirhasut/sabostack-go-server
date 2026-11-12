@@ -123,3 +123,36 @@ func TestReleaseHandsOverImmediately(t *testing.T) {
 		t.Fatalf("adopted %d after release, want 1", len(got))
 	}
 }
+
+// Review 2026-11-12: during a graceful shutdown the node's players reconnected to other
+// nodes, which still saw the owner alive and redirected them straight back to a node whose
+// listener was already closed. A leaving node is still alive (nobody adopts its matches
+// while it writes their final snapshots) but is no redirect target: "match moving".
+func TestReviewLeavingNodeIsNotARedirectTarget(t *testing.T) {
+	ctx := context.Background()
+	_, n := clusterNodes(t, "a", "b")
+	if err := n["a"].Save(ctx, "m", []byte("x")); err != nil {
+		t.Fatal(err)
+	}
+	if node, url, ok, _ := n["b"].Owner(ctx, "m"); !ok || node != "a" || url != "wss://a/ws" {
+		t.Fatalf("before leaving: owner %q url %q ok %v", node, url, ok)
+	}
+	if err := n["a"].Leaving(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if err := n["a"].Heartbeat(ctx, lease); err != nil { // heartbeats keep the mark
+		t.Fatal(err)
+	}
+	if node, url, ok, _ := n["b"].Owner(ctx, "m"); !ok || node != "a" || url != "" {
+		t.Fatalf("leaving owner: owner %q url %q ok %v, want a with no url (match moving)", node, url, ok)
+	}
+	if got, _ := n["b"].AdoptOrphans(ctx, 10); len(got) != 0 {
+		t.Fatalf("adopted %d matches of a node still writing its final snapshots", len(got))
+	}
+	if err := n["a"].Release(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if got, _ := n["b"].AdoptOrphans(ctx, 10); len(got) != 1 {
+		t.Fatalf("adopted %d after release, want 1", len(got))
+	}
+}
