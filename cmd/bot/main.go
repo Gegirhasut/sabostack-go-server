@@ -16,6 +16,7 @@ import (
 	"flag"
 	"fmt"
 	"math/rand/v2"
+	"net"
 	"net/http"
 	"os"
 	"slices"
@@ -254,6 +255,10 @@ type conn struct {
 
 func dial(ctx context.Context, url string, binary bool) (*conn, error) {
 	d := *websocket.DefaultDialer
+	// A dead server's address may not even refuse the connection (its IP is gone): give
+	// up after a few seconds like a real client, not after the OS connect timeout.
+	d.HandshakeTimeout = 3 * time.Second
+	d.NetDialContext = (&net.Dialer{Timeout: 3 * time.Second}).DialContext
 	if binary {
 		d.Subprotocols = []string{wire.Subprotocol}
 	}
@@ -501,7 +506,7 @@ func (b *bot) playMatch(ctx context.Context, every time.Duration) error {
 					if err := reattach(m.URL, pendingOr(pending, "redirect")); err != nil && pending != "drop" {
 						return err
 					}
-				case pending == "drop" && (m.Code == "match_not_found" || m.Code == "unavailable"):
+				case pending == "drop" && (m.Code == "match_moving" || m.Code == "match_not_found" || m.Code == "unavailable"):
 					// The match is between nodes (its server died, no one adopted it yet):
 					// keep trying until the recovery window closes.
 					select {

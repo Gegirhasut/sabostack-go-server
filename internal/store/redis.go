@@ -216,6 +216,10 @@ func (s *Redis) LoadAll(ctx context.Context) (map[string][]byte, error) {
 }
 
 // Owner implements Directory. In legacy mode nothing is known about other nodes.
+//
+// If the owner is a cluster member whose heartbeat has expired (it died and its matches
+// are about to be adopted), url is empty: sending the client to a dead address would only
+// make it wait for a connect timeout.
 func (s *Redis) Owner(ctx context.Context, id string) (node, url string, ok bool, err error) {
 	if s.node == "" {
 		return "", "", false, nil
@@ -228,5 +232,15 @@ func (s *Redis) Owner(ctx context.Context, id string) (node, url string, ok bool
 		return "", "", false, err
 	}
 	node, url, _ = strings.Cut(v, " ")
+	var alive *redis.IntCmd
+	var isMember *redis.BoolCmd
+	_, err = s.rdb.Pipelined(ctx, func(p redis.Pipeliner) error {
+		alive = p.Exists(ctx, s.aliveKey(node))
+		isMember = p.SIsMember(ctx, s.nodesKey(), node)
+		return nil
+	})
+	if err == nil && isMember.Val() && alive.Val() == 0 {
+		url = "" // dead member: the match is moving
+	}
 	return node, url, true, nil
 }

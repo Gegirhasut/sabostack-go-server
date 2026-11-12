@@ -83,17 +83,18 @@ func (c *checker) event(e protocol.Event) {
 }
 
 // snapshot checks a (re)attach snapshot: its events must continue the stream exactly.
+//
+// eventsComplete=false means the client's history is no longer valid: the bounded log no
+// longer reaches back to it, or the match was restored after a crash and rewound to its
+// last snapshot (events, ticks and acks the client saw after that point are gone). The
+// client must take the snapshot state as its new baseline, which is what the checker
+// does too; outside that case, anything going backwards is a violation.
 func (c *checker) snapshot(s protocol.Snapshot) {
-	switch {
-	case !s.EventsComplete && len(s.Events) > 0:
-		// The bounded log no longer reaches back to what we saw: the server says so, and
-		// the stream continues from the oldest event it still has.
-		c.events = max(c.events, s.Events[0].Seq-1)
-		c.resync(s.State)
-	case !s.EventsComplete:
-		c.events = max(c.events, s.State.EventSeq)
-		c.resync(s.State)
-	case len(s.Events) > 0 && s.Events[0].Seq != c.events+1:
+	if !s.EventsComplete {
+		c.rebase(s.State)
+		return
+	}
+	if len(s.Events) > 0 && s.Events[0].Seq != c.events+1 {
 		c.fail("snapshot events start at %d, last seen %d", s.Events[0].Seq, c.events)
 	}
 	for _, e := range s.Events {
@@ -105,10 +106,15 @@ func (c *checker) snapshot(s protocol.Snapshot) {
 	c.state(s.State)
 }
 
-// resync takes the phase from an authoritative state after events were lost to the
-// bounded log (the phase checks cannot bridge the gap).
-func (c *checker) resync(st protocol.State) {
+// rebase adopts an authoritative state as the baseline for every later check.
+func (c *checker) rebase(st protocol.State) {
+	c.events, c.tick, c.ack, c.eventSeq = st.EventSeq, st.Tick, st.Ack, st.EventSeq
 	c.phase, c.round, c.roundOpen = st.Phase, st.Round, st.Phase == "playing"
+	c.stateRound = st.Round
+	for i := 0; i < len(st.Players) && i < 2; i++ {
+		c.score[i], c.lines[i], c.wins[i] = st.Players[i].Score, st.Players[i].Lines, st.Players[i].Wins
+	}
+	c.state(st) // shape checks
 }
 
 func (c *checker) state(st protocol.State) {

@@ -16,12 +16,16 @@ func TestFakeTickerFiresInOrderAndBlocks(t *testing.T) {
 		}
 	}()
 	f.Advance(35 * time.Millisecond) // returns only after 3 ticks were received
-	if len(got) != 3 {
-		t.Fatalf("received %d ticks, want 3", len(got))
-	}
+	// Received by the goroutine, not necessarily forwarded to got yet: read with a timeout
+	// instead of checking len(got) at once (that raced and failed under load).
 	for i := 1; i <= 3; i++ {
-		if at := <-got; !at.Equal(start.Add(time.Duration(i) * 10 * time.Millisecond)) {
-			t.Fatalf("tick %d at %v", i, at)
+		select {
+		case at := <-got:
+			if !at.Equal(start.Add(time.Duration(i) * 10 * time.Millisecond)) {
+				t.Fatalf("tick %d at %v", i, at)
+			}
+		case <-time.After(5 * time.Second):
+			t.Fatalf("tick %d never received", i)
 		}
 	}
 	if !f.Now().Equal(start.Add(35 * time.Millisecond)) {

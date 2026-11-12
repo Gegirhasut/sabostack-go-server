@@ -335,8 +335,10 @@ func TestSnapshotRestore(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if r.Phase != Playing || r.Round != 1 || r.EventSeq != m.EventSeq {
-		t.Fatalf("restored phase=%s round=%d", r.Phase, r.Round)
+	// A periodic (non-final) snapshot: the counters skip ahead so numbers a client may
+	// have seen after it are never reused (see TestRestoreFromCrashSnapshotNeverReusesEventNumbers).
+	if r.Phase != Playing || r.Round != 1 || r.EventSeq != m.EventSeq+rewindGap {
+		t.Fatalf("restored phase=%s round=%d eventSeq=%d", r.Phase, r.Round, r.EventSeq)
 	}
 	if got := r.PhaseEnds.Sub(m.PhaseEnds); got != downtime {
 		t.Fatalf("deadline shifted by %v, want %v", got, downtime)

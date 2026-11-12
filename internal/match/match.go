@@ -99,7 +99,8 @@ type Seat struct {
 	Wins      int           `json:"wins"`
 	Board     *game.Board   `json:"board"`
 
-	sink Sink
+	sink    Sink
+	rewound bool // restored from a non-final snapshot; cleared by the next Attach
 }
 
 // Match is the full state of one 1v1 match. Exported fields form the snapshot.
@@ -175,6 +176,9 @@ func (m *Match) Attach(token string, sink Sink, lastEventSeq uint64, now time.Ti
 		m.emit(now, protocol.Event{Kind: protocol.EvPlayerBack, Seat: intp(seat)})
 	}
 	events, complete := m.EventsSince(lastEventSeq)
+	if s.rewound {
+		complete, s.rewound = false, false
+	}
 	sink.Send(protocol.Snapshot{
 		Type: protocol.TypeSnapshot, MatchID: m.ID, Seat: seat,
 		State: m.StateFor(seat, now), Events: events, EventsComplete: complete,

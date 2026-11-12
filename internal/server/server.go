@@ -425,9 +425,13 @@ func (s *Server) resume(c *client, matchID, token string, lastEventSeq uint64) (
 	defer cancel()
 	actor, ok := s.mgr.Get(matchID)
 	if !ok {
-		if addr := s.ownerURL(ctx, matchID); addr != "" {
+		switch addr, moving := s.ownerURL(ctx, matchID); {
+		case addr != "":
 			c.Send(protocol.Error{Type: protocol.TypeError, Code: "wrong_server", Message: "match is on another server", URL: addr})
 			return nil, 0, errors.New("match on another node")
+		case moving:
+			c.Send(errMsg("match_moving", "the match's server is down and another one is taking it over; retry in a moment"))
+			return nil, 0, errors.New("match moving")
 		}
 		c.Send(errMsg("match_not_found", "no such match on this server"))
 		return nil, 0, errors.New("match not found")
@@ -446,15 +450,16 @@ func (s *Server) resume(c *client, matchID, token string, lastEventSeq uint64) (
 	return actor, seat, nil
 }
 
-// ownerURL asks the store's match directory which other node runs matchID.
-func (s *Server) ownerURL(ctx context.Context, matchID string) string {
+// ownerURL asks the store's match directory which other node runs matchID. moving means
+// its owner is dead and the match is being adopted by another node.
+func (s *Server) ownerURL(ctx context.Context, matchID string) (addr string, moving bool) {
 	dir, ok := s.mgr.Store().(store.Directory)
 	if !ok || matchID == "" {
-		return ""
+		return "", false
 	}
 	node, addr, found, err := dir.Owner(ctx, matchID)
 	if err != nil || !found || node == s.cfg.NodeID {
-		return ""
+		return "", false
 	}
-	return addr
+	return addr, addr == ""
 }

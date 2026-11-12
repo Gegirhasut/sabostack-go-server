@@ -253,8 +253,14 @@ func (a *Actor) crashed(r any) {
 	}
 }
 
+// persist snapshots the match; sync (a graceful stop) waits for the write and marks the
+// snapshot final.
 func (a *Actor) persist(now time.Time, sync bool) {
-	data, err := a.m.Snapshot(now)
+	snap := a.m.Snapshot
+	if sync {
+		snap = a.m.FinalSnapshot
+	}
+	data, err := snap(now)
 	if err != nil {
 		a.log.Error("snapshot encode failed", "err", err)
 		return

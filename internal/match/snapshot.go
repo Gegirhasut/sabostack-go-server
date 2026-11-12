@@ -12,18 +12,32 @@ const snapshotVersion = 1
 type snapshot struct {
 	Version int       `json:"version"`
 	SavedAt time.Time `json:"savedAt"`
-	Match   *Match    `json:"match"`
+	// Final: taken by a graceful stop, after which the match did not change. A match
+	// restored from any other snapshot has rewound to it (a crash loses the progress
+	// since the last periodic snapshot).
+	Final bool   `json:"final"`
+	Match *Match `json:"match"`
 }
+
+// rewindGap is added to the event and tick counters of a match restored from a
+// non-final snapshot, so the numbers a client already saw (for events that were lost with
+// the crashed process) are never reused for different events.
+const rewindGap = 10000
 
 // Snapshot serialises the full match state. Only the newest cfg.SnapshotEvents events of
 // the reconnect log are kept: the log dominated the snapshot size, and after a restore a
 // client that is further behind still gets the authoritative state (eventsComplete=false).
-func (m *Match) Snapshot(now time.Time) ([]byte, error) {
+func (m *Match) Snapshot(now time.Time) ([]byte, error) { return m.snapshot(now, false) }
+
+// FinalSnapshot is Snapshot for a graceful stop: restoring it loses nothing.
+func (m *Match) FinalSnapshot(now time.Time) ([]byte, error) { return m.snapshot(now, true) }
+
+func (m *Match) snapshot(now time.Time, final bool) ([]byte, error) {
 	c := *m
 	if n := m.cfg.SnapshotEvents; n > 0 && len(c.Events) > n {
 		c.Events = c.Events[len(c.Events)-n:]
 	}
-	return json.Marshal(snapshot{Version: snapshotVersion, SavedAt: now, Match: &c})
+	return json.Marshal(snapshot{Version: snapshotVersion, SavedAt: now, Final: final, Match: &c})
 }
 
 // Restore rebuilds a match from a snapshot taken at some earlier time.
@@ -59,6 +73,17 @@ func Restore(data []byte, cfg Config, now time.Time) (*Match, error) {
 	}
 	if (m.Phase == Countdown || m.Phase == Playing) && m.PausedAt.IsZero() {
 		m.PausedAt = now // frozen until both players are back (see checkPause)
+	}
+	if !s.Final {
+		// The state rewound to this snapshot: whatever happened after it is gone. Skip the
+		// counters ahead so lost event and tick numbers are never reused, and tell each
+		// player on their next attach that their history is invalid (eventsComplete=false:
+		// trust the snapshot state, resend un-acked inputs).
+		m.EventSeq += rewindGap
+		m.Tick += rewindGap
+		for _, seat := range m.Seats {
+			seat.rewound = true
+		}
 	}
 	m.dirty = true
 	return m, nil

@@ -21,9 +21,11 @@ type Options struct {
 }
 
 // DefaultOptions: a crashed node's matches resume elsewhere within about Lease +
-// AdoptEvery (≈ 12 s), inside the 20 s reconnect grace.
+// AdoptEvery (≈ 12 s), inside the 20 s reconnect grace. AdoptBatch is small on purpose:
+// one survivor taking every match of a dead node at once would double its load, while
+// batches spread them over the live nodes, one scan (2 s) apart.
 func DefaultOptions() Options {
-	return Options{Lease: 10 * time.Second, AdoptEvery: 2 * time.Second, AdoptBatch: 200}
+	return Options{Lease: 10 * time.Second, AdoptEvery: 2 * time.Second, AdoptBatch: 50}
 }
 
 // Node keeps this server's membership alive and adopts the matches of dead nodes.

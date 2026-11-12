@@ -85,7 +85,7 @@ func TestSnapshotKeepsOnlyNewestEvents(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(r.Events) != 5 || r.Events[0].Seq != 36 || r.EventSeq != 40 {
+	if len(r.Events) != 5 || r.Events[0].Seq != 36 || r.EventSeq != 40+rewindGap {
 		t.Fatalf("restored log: %d events from %d, EventSeq %d", len(r.Events), r.Events[0].Seq, r.EventSeq)
 	}
 	if len(m.Events) != 40 {
@@ -186,5 +186,50 @@ func TestNotOwnerEvictsActor(t *testing.T) {
 	defer sink.mu.Unlock()
 	if sink.closed != "match moved to another server" {
 		t.Fatalf("closed = %q", sink.closed)
+	}
+}
+
+// After a crash the match restores from its last periodic snapshot: events the client saw
+// after it are gone. Their numbers must never be reused for different events, and the
+// client must be told its history is invalid. A final (graceful-stop) snapshot loses
+// nothing and keeps the history complete.
+func TestRestoreFromCrashSnapshotNeverReusesEventNumbers(t *testing.T) {
+	cfg := testConfig()
+	m, tokens, sinks, now := newPlaying(t, cfg)
+	crashSnap, _ := m.Snapshot(now)
+	for i := 0; i < 3; i++ { // happened after the snapshot, then the process died
+		m.emit(now, protocol.Event{Kind: protocol.EvPaused})
+	}
+	seen := m.EventSeq
+	_ = sinks
+
+	r, err := Restore(crashSnap, cfg, now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	fresh := &fakeSink{}
+	if _, err := r.Attach(tokens[0], fresh, seen, now); err != nil {
+		t.Fatal(err)
+	}
+	snap, _ := fresh.lastSnapshot()
+	if snap.EventsComplete {
+		t.Fatal("history reported complete after a rewind")
+	}
+	if snap.State.EventSeq <= seen || snap.State.Tick <= m.Tick {
+		t.Fatalf("counters reused: eventSeq %d (client saw %d), tick %d (was %d)", snap.State.EventSeq, seen, snap.State.Tick, m.Tick)
+	}
+	r.emit(now, protocol.Event{Kind: protocol.EvResumed})
+	if e := fresh.events(); len(e) != 1 || e[0].Seq <= seen {
+		t.Fatalf("next event %+v reuses a number the client already saw (%d)", e, seen)
+	}
+
+	final, _ := m.FinalSnapshot(now)
+	r2, _ := Restore(final, cfg, now)
+	again := &fakeSink{}
+	if _, err := r2.Attach(tokens[1], again, m.EventSeq, now); err != nil {
+		t.Fatal(err)
+	}
+	if s2, _ := again.lastSnapshot(); !s2.EventsComplete || s2.State.EventSeq != m.EventSeq+1 {
+		t.Fatalf("graceful restore: complete=%v eventSeq=%d, want complete and %d", s2.EventsComplete, s2.State.EventSeq, m.EventSeq+1)
 	}
 }
