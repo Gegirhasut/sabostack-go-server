@@ -252,12 +252,6 @@ func (s *Server) Shutdown(ctx context.Context) error {
 	return err
 }
 
-// clientIP returns the address connection limits are keyed by.
-//
-// X-Forwarded-For is read from the right. Every proxy appends the address it received the
-// request from, so only the last TrustedProxies entries were written by our proxies;
-// everything to the left of them came from the client and is free to forge. (Taking the
-// first entry, as before, let a client pick any IP it liked and bypass -max-conns-per-ip.)
 // track registers a connection handler, or reports false once Shutdown has begun.
 func (s *Server) track() bool {
 	s.connMu.Lock()
@@ -269,6 +263,12 @@ func (s *Server) track() bool {
 	return true
 }
 
+// clientIP returns the address connection limits are keyed by.
+//
+// X-Forwarded-For is read from the right. Every proxy appends the address it received the
+// request from, so only the last TrustedProxies entries were written by our proxies;
+// everything to the left of them came from the client and is free to forge. (Taking the
+// first entry, as before, let a client pick any IP it liked and bypass -max-conns-per-ip.)
 func (s *Server) clientIP(r *http.Request) string {
 	if n := s.cfg.TrustedProxies; n > 0 {
 		var hops []string

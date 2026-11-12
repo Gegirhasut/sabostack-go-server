@@ -168,6 +168,16 @@ func (m *Matchmaker) JoinContext(ctx context.Context, name string) *lobby.Ticket
 		t.Deliver(lobby.Assignment{Err: err})
 		return t
 	}
+	// The player may have left while the ticket was being pushed, and the lost-ticket
+	// check may already have dropped the waiter then (nothing was in Redis yet to remove).
+	// Nobody would take this ticket out of the queue again, so it would be paired with a
+	// real player who then waits for opponent_never_joined. Take it out here.
+	if t.Gone() {
+		if n, _ := m.rdb.LRem(op, m.queueKey(), 1, w.raw).Result(); n > 0 {
+			m.forget(id)
+		}
+		return t
+	}
 	m.tryPair(op)
 	return t
 }

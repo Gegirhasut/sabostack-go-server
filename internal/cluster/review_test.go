@@ -295,3 +295,21 @@ func TestReviewGoneTicketAfterPopIsForgotten(t *testing.T) {
 		t.Fatalf("a disconnected player's ticket was requeued (queue length %d)", n)
 	}
 }
+
+// Third review: a player who left while JoinContext was pushing the ticket could leave a
+// ghost in the queue (the lost-ticket check dropped the waiter before the push landed),
+// which was then paired with a real player who waited for opponent_never_joined. A ticket
+// whose player is gone by the time the push returns is taken out at once.
+func TestReviewTicketOfPlayerWhoLeftDuringJoinIsNotQueued(t *testing.T) {
+	e := newEnv(t)
+	n1 := e.node(t, "n1")
+	ctx, leave := context.WithCancel(context.Background())
+	leave() // gone before the push completes
+	n1.JoinContext(ctx, "ghost")
+	if n := queueLen(e); n != 0 {
+		t.Fatalf("ticket of a player who already left is in the shared queue (length %d)", n)
+	}
+	if w := waiting(n1); w != 0 {
+		t.Fatalf("%d waiter(s) left for a player who already left", w)
+	}
+}
