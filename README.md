@@ -2,87 +2,93 @@
 
 [![ci](https://github.com/Gegirhasut/sabostack-go-server/actions/workflows/ci.yml/badge.svg)](https://github.com/Gegirhasut/sabostack-go-server/actions/workflows/ci.yml)
 
-Игровой сервер на Go для real-time PvP 1 на 1 с падающими блоками: авторитетный сервер,
-модель акторов, бинарный протокол с дельтами, переподключение без потери матча,
-восстановление после падения процесса и кластер из нескольких узлов, который переживает
-смерть узла посреди игры.
+**English** | [Русский](README.ru.md)
 
-Это сервер **[SaboStack](https://play.google.com/store/apps/details?id=com.sabostack.app)** —
-моей real-time PvP-игры для браузера и Android, опубликованной в Google Play (5K+ скачиваний).
+A Go game server for real-time 1v1 PvP with falling blocks: an authoritative server, the
+actor model, a binary delta protocol, reconnection without losing the match, recovery
+after a process crash, and a multi-node cluster that survives a node dying mid-game.
 
-## Коротко в цифрах
+It is the server of **[SaboStack](https://play.google.com/store/apps/details?id=com.sabostack.app)**,
+my real-time PvP game for browser and Android, published on Google Play (5K+ downloads).
 
-Ноутбук, WSL2 8 vCPU, сервер и боты на одной машине (методика в
+## Numbers at a glance
+
+One laptop, WSL2 with 8 vCPUs, server and bots on the same machine (methodology in
 [LOAD_TESTING.md](docs/LOAD_TESTING.md)):
 
-- **4000 WebSocket-подключений (2000 матчей)** без ошибок: input→ack p95 ≈ 50 мс. Это почти
-  ровно один серверный тик, сервер намеренно копит входы и рассылает состояние раз в 50 мс.
-- **Бинарный протокол с дельтами:** кадр состояния 14 байт вместо 926, кодирование за
-  535 нс без аллокаций вместо 7,6 мкс. Трафик сервер → клиент под нагрузкой меньше **в 18 раз**, CPU сервера ниже на 5–9 % ([WIRE.md](docs/WIRE.md)).
-- **Кластер:** узел убит по SIGKILL под нагрузкой — **188 из 188 игроков вернулись в свои
-  матчи** на других узлах (за 7–13 с в зависимости от момента падения), 0 ошибок. При выкатке (SIGTERM) — 206 из 206 за
-  3,9 с без потери прогресса ([CLUSTER.md](docs/CLUSTER.md)).
-- **~76 КБ памяти и ~0,05 % ядра на игрока.** Ограничивает CPU, а не память.
-- **109 тестов и 2 fuzz-цели, все проходят с `-race`.** 13 тестов воспроизводят найденные
-  баги: каждый падает на коде до исправления и проходит после ([HARDENING.md](docs/HARDENING.md)).
-  Ещё 24 закрывают дефекты, найденные позже ([HARDENING.md](docs/HARDENING.md#найдено-позже)).
-  Тесты хранилища и кластера идут и на miniredis, и на настоящем Redis.
-  Нагрузочный бот проверяет инварианты протокола в каждом кадре: в финальных прогонах
-  0 нарушений.
+- **4,000 WebSocket connections (2,000 matches)** with no errors: input→ack p95 ≈ 50 ms.
+  That is almost exactly one server tick: the server batches inputs on purpose and
+  broadcasts state every 50 ms.
+- **Binary delta protocol:** a state frame is 14 bytes instead of 926, encoded in 535 ns
+  with zero allocations instead of 7.6 µs. Server-to-client traffic under load is
+  **18× lower**, server CPU 5–9 % lower ([WIRE.md](docs/WIRE.md)).
+- **Cluster:** a node killed with SIGKILL under load — **188 of 188 players got back into
+  their matches** on other nodes (within 7–13 s, depending on when the node died), 0
+  errors. On a rolling deploy (SIGTERM): 206 of 206 within 3.9 s, with no lost progress
+  ([CLUSTER.md](docs/CLUSTER.md)).
+- **~76 KB of memory and ~0.05 % of a core per player.** CPU is the limit, not memory.
+- **109 tests and 2 fuzz targets, all passing under `-race`.** 13 tests reproduce bugs
+  found while hardening: each fails on the code before the fix and passes after it
+  ([HARDENING.md](docs/HARDENING.md)). 24 more cover defects found later
+  ([HARDENING.md](docs/HARDENING.md#найдено-позже)). The store and cluster tests run
+  against both miniredis and a real Redis. The load bot checks protocol invariants on
+  every frame: 0 violations in the final runs.
 
-## Документация
+## Documentation
 
-| Документ | О чём |
+The detailed documents are in Russian.
+
+| Document | Contents |
 |---|---|
-| [ARCHITECTURE.md](docs/ARCHITECTURE.md) | Компоненты, машина состояний, модель акторов, таймеры, переподключение, восстановление. |
-| [WIRE.md](docs/WIRE.md) | Бинарный протокол: формат кадров, где считаются дельты, как проверена корректность, замеры. |
-| [CLUSTER.md](docs/CLUSTER.md) | Несколько узлов: живость, перехват матчей, fencing, общий матчмейкинг, демо с убийством узла. |
-| [HARDENING.md](docs/HARDENING.md) | Что было не так под нагрузкой и под атакой, тест на каждый баг, профилирование памяти. |
-| [LOAD_TESTING.md](docs/LOAD_TESTING.md) | Методика, ступени до 6000 подключений, ёмкость, soak, шторм, сравнения версий и протоколов. |
+| [ARCHITECTURE.md](docs/ARCHITECTURE.md) | Components, state machine, actor model, timers, reconnection, recovery. |
+| [WIRE.md](docs/WIRE.md) | Binary protocol: frame format, where deltas are computed, how correctness is checked, measurements. |
+| [CLUSTER.md](docs/CLUSTER.md) | Multiple nodes: liveness, match takeover, fencing, shared matchmaking, the node-kill demo. |
+| [HARDENING.md](docs/HARDENING.md) | What went wrong under load and under attack, a test for every bug, memory profiling. |
+| [LOAD_TESTING.md](docs/LOAD_TESTING.md) | Methodology, steps up to 6,000 connections, capacity, soak, reconnect storm, version and protocol comparisons. |
 
-## Что демонстрирует проект
+## What the project demonstrates
 
-| Тема | Где | Как |
+| Topic | Where | How |
 |---|---|---|
-| Машина состояний | `internal/match/phase.go`, `match.go` | Явная цепочка `Waiting → Countdown → Playing → RoundEnd → MatchEnd` с таблицей переходов. Недопустимый переход — баг: внутри паника, наружу `ErrIllegalTransition`. |
-| Одновременные действия | `internal/match/actor.go` | Одна goroutine на матч единолично владеет его состоянием, вокруг игровой логики нет блокировок. Входы обоих игроков применяются в порядке прихода, у каждого места свой лимит, флудер не вытесняет соперника. |
-| Идемпотентность | `Match.Input` | Каждый вход несёт `seq`, повторы и устаревшие отбрасываются. Seq переживает перезапуск и перехват матча другим узлом. |
-| Бинарный протокол | `internal/wire`, `internal/server/conn.go` | Subprotocol `sabostack.bin.v1`. Дельта считается в writer-goroutine относительно того, что *реально* ушло клиенту, поэтому она согласована со схлопыванием очереди и переподключениями. Fuzzing нашёл и закрыл падение декодера. |
-| Таймеры | `Match.Advance`, `internal/clock` | Тик 20 Гц, все таймеры — дедлайны на подменяемых часах, тесты детерминированы. |
-| Переподключение | `Match.Attach` | Сессионный токен (хранится только SHA-256), первым сообщением снапшот с пропущенными событиями. Пауза ограничена бюджетом, чтобы проигрывающий не мог заморозить матч. |
-| Восстановление после падения | `snapshot.go`, `manager.go` | Снапшоты пишут несколько персистеров со схлопыванием и пачками через pipeline, с circuit breaker на случай отказа Redis. После отката к снапшоту номера событий никогда не переиспользуются. |
-| Кластер | `internal/cluster`, `internal/store/cluster.go` | Аренда узла одним ключом, перехват матчей мёртвого узла пачками под локом, Lua-fencing владельца, самоограничение при потере Redis, общая очередь матчмейкинга с pub/sub и редиректами. |
-| Изоляция сбоев | `Actor.run` | Паника в одном матче прерывает только его. |
-| Защита от клиентов | `internal/server` | Token bucket до декодирования, лимиты подключений, Origin, валидация имени, схлопывание кадров `state` для медленных клиентов. |
-| Эксплуатация | `cmd/server`, `internal/metrics` | `/healthz`, `/readyz`, draining, admin-порт с `/metrics` и pprof, трафик и причины отключений в метриках, JSON-логи, Docker и compose на 1 и 3 узла. |
-| Нагрузка | `cmd/bot`, `cmd/loadreport`, `scripts/` | Бот играет в обоих протоколах, проверяет инварианты, ходит по узлам и переживает их смерть. `loadreport` строит таблицы из сырых JSON (медианы по повторам). |
+| State machine | `internal/match/phase.go`, `match.go` | An explicit `Waiting → Countdown → Playing → RoundEnd → MatchEnd` chain with a transition table. An illegal transition is a bug: a panic inside, `ErrIllegalTransition` outside. |
+| Simultaneous actions | `internal/match/actor.go` | One goroutine per match owns its state; there are no locks around game logic. Both players' inputs are applied in arrival order, each seat has its own limit, so a flooder cannot crowd out the opponent. |
+| Idempotency | `Match.Input` | Every input carries a `seq`; duplicates and stale ones are dropped. The seq survives a restart and a takeover by another node. |
+| Binary protocol | `internal/wire`, `internal/server/conn.go` | Subprotocol `sabostack.bin.v1`. The delta is computed in the writer goroutine against what was *actually* sent to the client, so it stays consistent with outbox conflation and reconnects. Fuzzing found and closed a decoder crash. |
+| Timers | `Match.Advance`, `internal/clock` | 20 Hz tick; every timer is a deadline on a swappable clock, so tests are deterministic. |
+| Reconnection | `Match.Attach` | A session token (only its SHA-256 is stored); the first message is a snapshot with the missed events. Pausing is capped by a budget, so a losing player cannot freeze the match. |
+| Crash recovery | `snapshot.go`, `manager.go` | Snapshots are written by several persisters with coalescing and pipelined batches, behind a circuit breaker for Redis outages. After a rewind to a snapshot, event numbers are never reused. |
+| Cluster | `internal/cluster`, `internal/store/cluster.go` | A one-key lease per node, batched takeover of a dead node's matches under a lock, Lua fencing of the owner, self-fencing on Redis loss, a shared matchmaking queue with pub/sub and redirects. |
+| Fault isolation | `Actor.run` | A panic in one match stops only that match. |
+| Client protection | `internal/server` | Token bucket before decoding, connection limits, Origin checks, name validation, `state` frame conflation for slow clients. |
+| Operations | `cmd/server`, `internal/metrics` | `/healthz`, `/readyz`, draining, an admin port with `/metrics` and pprof, traffic and disconnect reasons in metrics, JSON logs, Docker and compose for 1 and 3 nodes. |
+| Load | `cmd/bot`, `cmd/loadreport`, `scripts/` | The bot plays both protocols, checks invariants, moves between nodes and survives their death. `loadreport` builds tables from raw JSON (medians over repeated runs). |
 
-## Архитектура
+## Architecture
 
 ```mermaid
 flowchart LR
-    subgraph Клиенты
-        A[Игрок A<br/>WebSocket JSON]
-        B[Игрок B<br/>WebSocket binary]
+    subgraph Clients
+        A[Player A<br/>WebSocket JSON]
+        B[Player B<br/>WebSocket binary]
     end
 
-    subgraph Узел["Узел (один из N)"]
+    subgraph Node["Node (one of N)"]
         H[HTTP mux<br/>/ws /healthz /readyz]
-        Q[матчмейкер<br/>локальный или общий]
+        Q[matchmaker<br/>local or shared]
         M[match.Manager]
-        subgraph Actor["match.Actor (goroutine на матч)"]
+        subgraph Actor["match.Actor (goroutine per match)"]
             direction TB
-            C[(команды)] --> L{select}
-            I[(входы)] --> L
-            T[тик 50 мс] --> L
+            C[(commands)] --> L{select}
+            I[(inputs)] --> L
+            T[50 ms tick] --> L
             L --> S[Match]
         end
-        W[writer на сокет<br/>JSON или дельта]
-        P[персистеры ×4]
-        N[cluster.Node<br/>аренда, перехват]
+        W[writer per socket<br/>JSON or delta]
+        P[persisters ×4]
+        N[cluster.Node<br/>lease, takeover]
     end
 
-    R[(Redis<br/>снапшоты, владельцы,<br/>аренды, очередь)]
+    R[(Redis<br/>snapshots, owners,<br/>leases, queue)]
 
     A & B --> H
     H --> Q --> M
@@ -93,65 +99,66 @@ flowchart LR
     N <--> R
 ```
 
-### Машина состояний матча
+### Match state machine
 
 ```mermaid
 stateDiagram-v2
-    [*] --> Waiting: пара найдена
-    Waiting --> Countdown: оба игрока подключены
-    Waiting --> MatchEnd: таймаут входа
-    Countdown --> Playing: отсчёт закончился
-    Playing --> RoundEnd: поле переполнено или таймер раунда
-    RoundEnd --> Countdown: следующий раунд
-    RoundEnd --> MatchEnd: у кого-то 2 победы / сыграно максимум раундов
-    Countdown --> MatchEnd: тех. поражение (окно или бюджет паузы)
-    Playing --> MatchEnd: тех. поражение (отключение / бездействие)
+    [*] --> Waiting: pair found
+    Waiting --> Countdown: both players connected
+    Waiting --> MatchEnd: join timeout
+    Countdown --> Playing: countdown over
+    Playing --> RoundEnd: board overflow or round timer
+    RoundEnd --> Countdown: next round
+    RoundEnd --> MatchEnd: someone has 2 wins / max rounds played
+    Countdown --> MatchEnd: forfeit (grace window or pause budget)
+    Playing --> MatchEnd: forfeit (disconnect / idle)
     MatchEnd --> [*]
 ```
 
-Пока игрок отключён, `Countdown` и `Playing` стоят на паузе. Техническое поражение
-получает тот, кто отсутствует дольше окна переподключения (20 с) или в сумме исчерпал
-бюджет паузы (45 с за матч).
+While a player is disconnected, `Countdown` and `Playing` are paused. A player forfeits
+if they stay away longer than the reconnect window (20 s) or use up the pause budget in
+total (45 s per match).
 
-### Правила игры (упрощённые)
+### Game rules (simplified)
 
-- Поле 10×20, семь тетромино из 7-bag, в каждом раунде у обоих одна последовательность
-  фигур.
-- Очистка 2, 3 или 4 линий отправляет сопернику 1, 2 или 4 мусорных ряда, свои очистки
-  сначала гасят входящий мусор.
-- Раунд кончается переполнением поля или по таймеру. Матч до двух побед.
+- 10×20 board, seven tetrominoes from a 7-bag; in each round both players get the same
+  piece sequence.
+- Clearing 2, 3 or 4 lines sends the opponent 1, 2 or 4 garbage rows; your own clears
+  cancel incoming garbage first.
+- A round ends on board overflow or by timer. The match is best of three (first to two
+  wins).
 
-## Протокол
+## Protocol
 
-JSON-кадры, тип в поле `type`. Клиент, запросивший WebSocket-subprotocol
-`sabostack.bin.v1`, получает `state` и `pong` бинарными дельтами и может слать `input` и
-`ping` бинарно. Формат описан в [WIRE.md](docs/WIRE.md).
+JSON frames with the type in the `type` field. A client that asks for the WebSocket
+subprotocol `sabostack.bin.v1` receives `state` and `pong` as binary deltas and may send
+`input` and `ping` in binary. The format is described in [WIRE.md](docs/WIRE.md).
 
-### Клиент → сервер
+### Client → server
 
-| `type` | Поля | Примечание |
+| `type` | Fields | Notes |
 |---|---|---|
-| `join` | `name` | Первое сообщение: встать в очередь. Имя — 1–24 печатаемых символа. |
-| `resume` | `matchId`, `token`, `lastEventSeq` | Первое сообщение: вернуться в матч после обрыва, перезапуска или перехода на другой узел. |
-| `input` | `seq`, `action` | `left`, `right`, `rotate`, `soft_drop`, `hard_drop`. `seq` растёт, повторы игнорируются. |
-| `ping` | `t` | Возвращается как `pong`. |
+| `join` | `name` | First message: join the queue. Name: 1–24 printable characters. |
+| `resume` | `matchId`, `token`, `lastEventSeq` | First message: return to a match after a dropped connection, a restart or a move to another node. |
+| `input` | `seq`, `action` | `left`, `right`, `rotate`, `soft_drop`, `hard_drop`. `seq` increases; duplicates are ignored. |
+| `ping` | `t` | Echoed as `pong`. |
 
-Сообщения клиента проходят token bucket (40/с, всплеск 20). Упорный флудер отключается с
-ошибкой `rate_limited`.
+Client messages go through a token bucket (40/s, burst 20). A persistent flooder is
+disconnected with `rate_limited`.
 
-### Сервер → клиент
+### Server → client
 
-| `type` | Поля | Когда |
+| `type` | Fields | When |
 |---|---|---|
-| `queued` | | После `join`. |
-| `matched` | `matchId`, `seat`, `token`, `opponent`, `url` | Соперник найден. Если есть `url`, матч идёт на другом узле: подключиться туда и сделать `resume`. |
-| `snapshot` | `matchId`, `seat`, `state`, `events[]`, `eventsComplete` | Всегда первое сообщение после подключения к матчу. `eventsComplete=false` — история клиента недействительна (журнал короче или матч откатился к снапшоту после падения узла): доверять `state`, переотправить неподтверждённые входы. |
-| `state` | `tick`, `phase`, `round`, `paused`, `remainingMs`, `ack`, `eventSeq`, `players[]` | Не чаще раза за тик и только при изменениях. Неотправленный `state` заменяется новым. |
-| `event` | `event: {seq, atMs, kind, ...}` | `phase`, `cleared`, `garbage`, `round_over`, `match_over`, `player_left`, `player_back`, `paused`, `resumed`. Никогда не теряются и не переупорядочиваются. |
-| `error` | `code`, `message`, `url` | `wrong_server` (переподключиться к `url`), `match_moving` (узел матча упал, его перехватывают — повторить), `match_not_found`, `bad_token`, `rate_limited`, `unavailable`, `bad_name`, `bad_request`, `bad_json`, `timeout`. |
+| `queued` | | After `join`. |
+| `matched` | `matchId`, `seat`, `token`, `opponent`, `url` | Opponent found. If `url` is set, the match runs on another node: connect there and `resume`. |
+| `snapshot` | `matchId`, `seat`, `state`, `events[]`, `eventsComplete` | Always the first message after attaching to a match. `eventsComplete=false` means the client's history is invalid (the log is shorter, or the match rewound to a snapshot after a node crash): trust `state`, resend unacknowledged inputs. |
+| `state` | `tick`, `phase`, `round`, `paused`, `remainingMs`, `ack`, `eventSeq`, `players[]` | At most once per tick, and only on change. An unsent `state` is replaced by a newer one. |
+| `event` | `event: {seq, atMs, kind, ...}` | `phase`, `cleared`, `garbage`, `round_over`, `match_over`, `player_left`, `player_back`, `paused`, `resumed`. Never lost or reordered. |
+| `error` | `code`, `message`, `url` | `wrong_server` (reconnect to `url`), `match_moving` (the match's node died and it is being taken over — retry), `match_not_found`, `bad_token`, `rate_limited`, `unavailable`, `bad_name`, `bad_request`, `bad_json`, `timeout`. |
 | `pong` | `t` | |
 
-Причины в `match_over`: `rounds`, `draw`, `opponent_disconnected`, `both_disconnected`,
+`match_over` reasons: `rounds`, `draw`, `opponent_disconnected`, `both_disconnected`,
 `opponent_idle`, `both_idle`, `opponent_never_joined`, `internal_error`.
 
 ```text
@@ -163,183 +170,189 @@ JSON-кадры, тип в поле `type`. Клиент, запросивший
 ← {"type":"event","event":{"seq":2,"kind":"phase","phase":"playing","round":1,"durationMs":90000}}
 → {"type":"input","seq":1,"action":"rotate"}
 ← {"type":"state","tick":64,"phase":"playing","ack":1,"players":[…]}
-   … соединение оборвалось …
+   … connection dropped …
 → {"type":"resume","matchId":"9f2c…","token":"4be1…","lastEventSeq":2}
 ← {"type":"snapshot",…,"events":[{"seq":3,"kind":"player_left","seat":0},{"seq":4,"kind":"paused"},{"seq":5,"kind":"player_back","seat":0}]}
 ← {"type":"event","event":{"seq":6,"kind":"resumed"}}
 ```
 
-## Запуск
+## Running
 
-Нужен Go 1.25 или новее.
+Requires Go 1.25 or newer.
 
 ```sh
-go run ./cmd/server                        # :8080, хранилище в памяти
-go run ./cmd/server -redis localhost:6379  # снапшоты в Redis: после перезапуска матчи продолжаются
-go run ./cmd/server -h                     # все флаги
+go run ./cmd/server                        # :8080, in-memory store
+go run ./cmd/server -redis localhost:6379  # snapshots in Redis: matches continue after a restart
+go run ./cmd/server -h                     # all flags
 
-go run ./cmd/bot -pairs 100                # один матч на пару
-go run ./cmd/bot -pairs 500 -duration 60s -proto bin   # постоянная нагрузка, бинарный протокол
+go run ./cmd/bot -pairs 100                # one match per pair
+go run ./cmd/bot -pairs 500 -duration 60s -proto bin   # sustained load, binary protocol
 ```
 
 Docker:
 
 ```sh
-docker compose up --build                                          # один узел и Redis
-docker compose -f docker-compose.cluster.yml up --build            # три узла и Redis
-docker compose -f docker-compose.cluster.yml run --rm bot          # нагрузка через все узлы
-scripts/cluster-failover.sh                                        # убить узел под нагрузкой
-scripts/cluster-failover.sh 300 35 SIGTERM                         # выкатка узла под нагрузкой
+docker compose up --build                                          # one node and Redis
+docker compose -f docker-compose.cluster.yml up --build            # three nodes and Redis
+docker compose -f docker-compose.cluster.yml run --rm bot          # load through all nodes
+scripts/cluster-failover.sh                                        # kill a node under load
+scripts/cluster-failover.sh 300 35 SIGTERM                         # roll a node under load
 ```
 
-Кластер без Docker: у каждого узла свои `-node-id` и `-public-url`, общий `-redis`:
+A cluster without Docker: each node has its own `-node-id` and `-public-url`, and they
+share `-redis`:
 
 ```sh
 go run ./cmd/server -addr :8081 -redis localhost:6379 -node-id game-1 -public-url ws://localhost:8081/ws
 go run ./cmd/server -addr :8082 -redis localhost:6379 -node-id game-2 -public-url ws://localhost:8082/ws
 ```
 
-Основные флаги для продакшена:
+Main production flags:
 
-| Флаг | По умолчанию | Зачем |
+| Flag | Default | Purpose |
 |---|---|---|
-| `-admin-addr` | выкл. | `/metrics` и `/debug/pprof` на внутреннем адресе. |
-| `-allowed-origins` | любой | Разрешённые Origin браузера. |
-| `-max-conns`, `-max-conns-per-ip` | выкл. | Лимиты подключений. |
-| `-trusted-proxies` | 0 | Сколько наших прокси стоит перед сервером. IP клиента — столько адресов `X-Forwarded-For` справа. |
-| `-input-rate`, `-input-burst` | 40, 20 | Token bucket на сообщения клиента. |
-| `-node-id`, `-public-url`, `-lease`, `-shared-queue` | выкл., —, 10 с, вкл. | Кластер ([CLUSTER.md](docs/CLUSTER.md)). |
-| `-drain-timeout` | 0 | По SIGTERM перестать матчить и дать матчам доиграть. |
-| `-pause-budget`, `-reconnect-grace`, `-idle-timeout` | 45 с, 20 с, 30 с | Правила отключений. |
-| `-ping-interval`, `-pong-wait` | 20 с, 30 с | Heartbeat. Почему именно так — в [HARDENING.md](docs/HARDENING.md#heartbeat-почему-по-умолчанию-20-с--30-с). |
+| `-admin-addr` | off | `/metrics` and `/debug/pprof` on an internal address. |
+| `-allowed-origins` | any | Allowed browser Origins. |
+| `-max-conns`, `-max-conns-per-ip` | off | Connection limits. |
+| `-trusted-proxies` | 0 | How many of our proxies stand in front of the server. The client IP is that many `X-Forwarded-For` entries from the right. |
+| `-input-rate`, `-input-burst` | 40, 20 | Token bucket for client messages. |
+| `-node-id`, `-public-url`, `-lease`, `-shared-queue` | off, —, 10 s, on | Cluster ([CLUSTER.md](docs/CLUSTER.md)). |
+| `-drain-timeout` | 0 | On SIGTERM, stop matchmaking and let running matches finish. |
+| `-pause-budget`, `-reconnect-grace`, `-idle-timeout` | 45 s, 20 s, 30 s | Disconnect rules. |
+| `-ping-interval`, `-pong-wait` | 20 s, 30 s | Heartbeat. Why these values: [HARDENING.md](docs/HARDENING.md#heartbeat-почему-по-умолчанию-20-с--30-с). |
 
-### Чеклист продакшена
+### Production checklist
 
-Значения по умолчанию рассчитаны на локальный запуск и нагрузочные тесты с одного IP. При
-каждом небезопасном умолчании сервер пишет предупреждение в лог при старте.
+The defaults suit local runs and load tests from a single IP. The server logs a warning
+at startup for every unsafe default.
 
-- [ ] `-allowed-origins` — домены веб-клиента. Иначе страница с любого сайта может открыть
-      WebSocket от имени игрока.
-- [ ] `-max-conns-per-ip` и `-max-conns`. За балансировщиком также `-trusted-proxies` по
-      числу прокси, иначе все клиенты будут с IP балансировщика. С `-trusted-proxies` порт
-      сервера должен быть доступен **только** прокси (firewall, приватная сеть): клиент,
-      подключившийся напрямую, подделает `X-Forwarded-For`.
-- [ ] `-admin-addr` на внутреннем интерфейсе и `-public-metrics=false`: `/metrics` и
-      `/debug/pprof` не должны быть видны снаружи.
-- [ ] `-redis`, а для нескольких узлов ещё `-node-id` и `-public-url` у каждого. Без Redis
-      матчи не переживают перезапуск.
-- [ ] `-drain-timeout` не меньше длины матча и `terminationGracePeriod` оркестратора
-      больше него. Проверки готовности — на `/readyz`.
-- [ ] TLS на балансировщике (`wss://`). Сам сервер TLS не терминирует.
+- [ ] `-allowed-origins` — the web client's domains. Otherwise a page on any site can open
+      a WebSocket on a player's behalf.
+- [ ] `-max-conns-per-ip` and `-max-conns`. Behind a load balancer, also `-trusted-proxies`
+      with the number of proxies, or every client will have the balancer's IP. With
+      `-trusted-proxies` the server port must be reachable **only** by the proxies
+      (firewall, private network): a client connecting directly would forge
+      `X-Forwarded-For`.
+- [ ] `-admin-addr` on an internal interface and `-public-metrics=false`: `/metrics` and
+      `/debug/pprof` must not be visible from outside.
+- [ ] `-redis`, and for several nodes also a `-node-id` and `-public-url` for each. Without
+      Redis, matches do not survive a restart.
+- [ ] `-drain-timeout` at least as long as a match, and the orchestrator's
+      `terminationGracePeriod` longer than that. Readiness probes on `/readyz`.
+- [ ] TLS at the load balancer (`wss://`). The server does not terminate TLS itself.
 
-## Тесты
+## Tests
 
 ```sh
 go test -race ./...
 go test -run '^$' -fuzz FuzzDecodeState ./internal/wire
 ```
 
-[CI](.github/workflows/ci.yml) на каждый push:
+[CI](.github/workflows/ci.yml) on every push:
 - `gofmt`, `go mod tidy`, `go vet`, `staticcheck`, `govulncheck`;
-- `go test -race -count=2` на минимальной версии Go из `go.mod` и на текущей;
-- тесты хранилища, кластера и сервера на настоящем Redis 7 вместо miniredis
+- `go test -race -count=2` on the minimum Go version from `go.mod` and on the current one;
+- the store, cluster and server tests against a real Redis 7 instead of miniredis
   (`SABO_TEST_REDIS=host:port/15 go test -p 1 ./internal/store ./internal/cluster ./internal/server`;
-  каждая проверка очищает указанную базу, поэтому номер базы обязателен, а база 0 запрещена);
-- по 30 с fuzzing каждого декодера;
-- сборка Docker-образа и запуск с проверкой `/healthz`.
+  every test flushes the given database, so the database number is required and
+  database 0 is refused);
+- 30 s of fuzzing for each decoder;
+- a Docker image build and a run with a `/healthz` check.
 
-109 тестов и 2 fuzz-цели. Конкурентные и кластерные тесты прогонялись многократно
-(`-count=20…300`), чтобы исключить нестабильность.
+109 tests and 2 fuzz targets. The concurrency and cluster tests were run many times
+(`-count=20…300`) to rule out flakiness.
 
-- **Воспроизведение багов (13):** каждый найденный баг покрыт тестом на старом API: на
-  коде до исправления он падает с осмысленным сообщением, после проходит
-  ([таблица](docs/HARDENING.md#баги-и-их-воспроизведение)).
-- **Дефекты, найденные позже (24):** подмена IP через `X-Forwarded-For`, лишнее время до
-  idle-форфита после переподключения, self-fencing до истечения аренды, повтор
-  несохранённого снапшота, уходящий узел не служит редиректом, `pong` в очереди, отсутствие
-  двойного назначения в матчмейкинге, гонка `WaitGroup` при остановке, зомби-матч на
-  изолированном узле, утечка заявок ушедших игроков, заявка-призрак в очереди, матч
-  объявляется только после записи в хранилище, снапшоты неизвестной версии не удаляются при
-  выкатке, токены игроков не попадают в Redis ([HARDENING.md](docs/HARDENING.md#найдено-позже)).
-- **Бинарный протокол:** 20 000 случайных шагов round-trip, побайтное совпадение полей,
-  собранных из дельт, с авторитетным снапшотом через настоящий WebSocket, fuzzing обоих
-  декодеров, бенчмарки.
-- **Кластер:** перехват, fencing вернувшегося зомби, пачки, `Release`, пара игроков с
-  разных узлов, потерянное назначение, отказ Redis дольше аренды, два настоящих сервера,
-  где узел-хозяин падает посреди раунда, а матч доигрывается на другом.
-- **Игра и протокол:** таблица переходов, полный матч, идемпотентность под `-race`,
-  таймеры на фейковых часах, бюджет паузы, восстановление со сдвигом дедлайнов, порядок
-  сообщений при `resume`, откат после падения без повтора номеров событий.
-- **Транспорт и эксплуатация:** флуд, схлопывание очереди, Origin, лимит на IP, draining,
-  редирект к владельцу, admin-порт, битые кадры.
+- **Bug reproductions (13):** every bug found while hardening is covered by a test written
+  against the old API: it fails with a meaningful message on the code before the fix and
+  passes after it ([table](docs/HARDENING.md#баги-и-их-воспроизведение)).
+- **Defects found later (24):** IP spoofing via `X-Forwarded-For`, extra time before an
+  idle forfeit after reconnecting, self-fencing before the lease expires, retrying an
+  unsaved snapshot, a leaving node is no redirect target, `pong` while queued, no double
+  assignment in matchmaking, a `WaitGroup` race at shutdown, a zombie match on a fenced
+  node, leaked tickets of players who left, a ghost ticket in the queue, a match is
+  announced only after it is stored, snapshots of an unknown version are not deleted
+  during a rollout, player tokens never reach Redis
+  ([HARDENING.md](docs/HARDENING.md#найдено-позже)).
+- **Binary protocol:** 20,000 random round-trip steps, byte-for-byte equality of
+  delta-built fields with the authoritative snapshot over a real WebSocket, fuzzing of
+  both decoders, benchmarks.
+- **Cluster:** takeover, fencing of a returning zombie, batches, `Release`, a pair of
+  players from different nodes, a lost assignment, a Redis outage longer than the lease,
+  two real servers where the owning node dies mid-round and the match finishes on the
+  other.
+- **Game and protocol:** transition table, a full match, idempotency under `-race`,
+  timers on a fake clock, the pause budget, restore with shifted deadlines, message order
+  on `resume`, a rewind after a crash without reusing event numbers.
+- **Transport and operations:** flooding, outbox conflation, Origin, per-IP limit,
+  draining, redirect to the owner, admin port, malformed frames.
 
-## Нагрузочное тестирование (кратко)
+## Load testing (summary)
 
-Методика и сырые данные — в [docs/LOAD_TESTING.md](docs/LOAD_TESTING.md). Сервер и боты на
-одном ноутбуке в WSL2 (8 vCPU, i9-10885H), loopback, параллельно шла посторонняя нагрузка.
-Каждый бот шлёт 10 входов в секунду и после матча снова встаёт в очередь.
+Methodology and raw data are in [docs/LOAD_TESTING.md](docs/LOAD_TESTING.md). Server and
+bots on one laptop under WSL2 (8 vCPUs, i9-10885H), loopback, with unrelated load running
+alongside. Each bot sends 10 inputs per second and rejoins the queue after a match.
 
-JSON-протокол, медианы по прогонам (сырые данные в `docs/loadtest/hardening/`):
+JSON protocol, medians over runs (raw data in `docs/loadtest/hardening/`):
 
-| Пар | Подключений | RSS сервера | CPU сервера | Input→ack p50 / p95 / p99 | Ошибок / обрывов |
+| Pairs | Connections | Server RSS | Server CPU | Input→ack p50 / p95 / p99 | Errors / drops |
 |---:|---:|---:|---:|---:|---:|
-| 500 | 1000 | 106 МБ | 92 % ядра | 25,6 / 48,4 / 50,4 мс | 0 / 0 |
-| 1000 | 2000 | 187 МБ | 150 % ядра | 25,6 / 48,4 / 50,6 мс | 0 / 0 |
-| 2000 | 4000 | 339 МБ | 255 % ядра | 28,2 / 61,7 / 132 мс | 0 / 0 |
-| 3000 | 6000 | 479 МБ | 330 % ядра | 32,1 / 96,0 / 198 мс | 0 / 0 |
+| 500 | 1,000 | 106 MB | 92 % of a core | 25.6 / 48.4 / 50.4 ms | 0 / 0 |
+| 1,000 | 2,000 | 187 MB | 150 % of a core | 25.6 / 48.4 / 50.6 ms | 0 / 0 |
+| 2,000 | 4,000 | 339 MB | 255 % of a core | 28.2 / 61.7 / 132 ms | 0 / 0 |
+| 3,000 | 6,000 | 479 MB | 330 % of a core | 32.1 / 96.0 / 198 ms | 0 / 0 |
 
-Бинарный протокол на тех же ступенях (медианы, [WIRE.md](docs/WIRE.md#под-нагрузкой)):
+Binary protocol on the same steps (medians, [WIRE.md](docs/WIRE.md#под-нагрузкой)):
 
-| Пар | Трафик на клиента: JSON → дельты | CPU сервера: JSON → дельты | p95: JSON → дельты |
+| Pairs | Traffic per client: JSON → deltas | Server CPU: JSON → deltas | p95: JSON → deltas |
 |---:|---:|---:|---:|
-| 1000 | 3,65 → **0,20 КБ/с** | 171 → 162 % | 49 → 49 мс |
-| 2000 | 3,72 → **0,20 КБ/с** | 269 → 247 % | 161 → 84 мс |
-| 3000 | 3,65 → **0,20 КБ/с** | 312 → 314 % | 154 → 135 мс |
+| 1,000 | 3.65 → **0.20 KB/s** | 171 → 162 % | 49 → 49 ms |
+| 2,000 | 3.72 → **0.20 KB/s** | 269 → 247 % | 161 → 84 ms |
+| 3,000 | 3.65 → **0.20 KB/s** | 312 → 314 % | 154 → 135 ms |
 
-- Задержка input→ack — это в основном намеренное ожидание тика: в среднем полтика, не
-  больше одного тика.
-- На 3000 парах общая машина насыщается: сервер и боты делят 8 vCPU, и хвост задержки
-  определяет конкуренция за CPU, а не сервер.
-- Soak 1000 пар × 5 мин: RSS и goroutines стабильны. Шторм переподключений (20 %
-  клиентов): 100 % вернулись в свои матчи. Кластер из 3 узлов с Redis под нагрузкой и
-  с убийством узла — в [CLUSTER.md](docs/CLUSTER.md#демо-узел-убит-под-нагрузкой).
+- Input→ack latency is mostly the deliberate wait for the tick: half a tick on average,
+  never more than one tick.
+- At 3,000 pairs the shared machine saturates: server and bots share 8 vCPUs, and the
+  latency tail is set by competition for CPU, not by the server.
+- Soak, 1,000 pairs × 5 min: RSS and goroutines stay flat. Reconnect storm (20 % of
+  clients): 100 % got back into their matches. A 3-node cluster with Redis under load,
+  with a node killed — in [CLUSTER.md](docs/CLUSTER.md#демо-узел-убит-под-нагрузкой).
 
-## Решения и ограничения
+## Decisions and limitations
 
-- **Один матч — одна goroutine.** Игровая логика — синхронный код, который легко
-  тестировать. Цикл матча никогда не ждёт I/O: отправка клиенту, Redis и сеть идут через
-  очереди.
-- **Бинарными сделаны только горячие сообщения** (`state`, `input`): это почти весь
-  трафик. Редкие сообщения остались JSON ради читаемости.
-- **Безопасность важнее доступности при разделе:** узел, потерявший Redis дольше аренды,
-  останавливает свои матчи и поднимает их снова, когда Redis вернулся.
-- **Ограничения:**
-  - Кластеру нужен один Redis (или Sentinel), а не Redis Cluster: Lua-скрипты работают с
-    ключами разных слотов.
-  - После жёсткого падения узла матч откатывается к последнему снапшоту (до 1 с прогресса).
-  - Нет аутентификации, рейтинга и античита сверх авторитетного сервера и лимитов.
-  - Правила игры упрощены: нет hold, SRS-киков и lock delay.
+- **One match, one goroutine.** Game logic is synchronous code that is easy to test. The
+  match loop never waits on I/O: sending to clients, Redis and the network all go through
+  queues.
+- **Only the hot messages are binary** (`state`, `input`): they are nearly all the
+  traffic. Rare messages stay JSON for readability.
+- **Safety over availability under a partition:** a node that loses Redis for longer than
+  its lease stops its matches and brings them back once Redis returns.
+- **Limitations:**
+  - The cluster needs a single Redis (or Sentinel), not Redis Cluster: the Lua scripts
+    touch keys in different slots.
+  - After a hard node crash, a match rewinds to its last snapshot (up to 1 s of progress).
+  - No authentication, rating or anti-cheat beyond the authoritative server and the
+    limits.
+  - The game rules are simplified: no hold, SRS kicks or lock delay.
 
-## Структура
+## Layout
 
 ```text
-cmd/server        сервер: флаги, Redis/память, кластер, draining, штатная остановка
-cmd/bot           нагрузочный бот: JSON и binary, проверка инвариантов, работа с кластером
-cmd/loadreport    таблицы и графики docs/LOAD_TESTING.md из сырых JSON
-internal/clock    интерфейс Clock, реальные и фейковые часы
-internal/game     поле, фигуры, 7-bag, линии, мусор (чистая детерминированная логика)
-internal/match    машина состояний, актор, Manager, персистеры, снапшоты
-internal/lobby    локальная FIFO-очередь матчмейкинга
-internal/cluster  аренда узла, перехват матчей, общий матчмейкинг через Redis
-internal/store    Store; память, Redis, режим узлов с fencing, каталогом и арендами
-internal/wire     бинарный протокол: кодек дельт, fuzz-тесты
-internal/server   WebSocket, JSON и binary writer, rate limit, лимиты, health/ready/admin
-internal/protocol типы JSON-сообщений
-internal/metrics  коллекторы Prometheus
-docs/             документация и сырые результаты нагрузки (docs/loadtest/)
-scripts/          ступень нагрузки, сравнения версий и вариантов, демо отказа узла
+cmd/server        server: flags, Redis/memory, cluster, draining, graceful shutdown
+cmd/bot           load bot: JSON and binary, invariant checks, cluster-aware
+cmd/loadreport    tables and charts for docs/LOAD_TESTING.md from raw JSON
+internal/clock    Clock interface, real and fake clocks
+internal/game     board, pieces, 7-bag, lines, garbage (pure deterministic logic)
+internal/match    state machine, actor, Manager, persisters, snapshots
+internal/lobby    local FIFO matchmaking queue
+internal/cluster  node lease, match takeover, shared matchmaking over Redis
+internal/store    Store; memory, Redis, node mode with fencing, directory and leases
+internal/wire     binary protocol: delta codec, fuzz tests
+internal/server   WebSocket, JSON and binary writers, rate limit, limits, health/ready/admin
+internal/protocol JSON message types
+internal/metrics  Prometheus collectors
+docs/             documentation and raw load results (docs/loadtest/)
+scripts/          load steps, version and variant comparisons, node-failure demo
 ```
 
-## Лицензия
+## License
 
 MIT
