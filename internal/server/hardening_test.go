@@ -97,7 +97,7 @@ func TestValidName(t *testing.T) {
 	for name, want := range map[string]bool{
 		"alice": true, "Игрок_1": true, "名前": true, strings.Repeat("я", 24): true,
 		"": false, strings.Repeat("я", 25): false, "a\x00b": false, "bad\nname": false,
-		"zero​width": false, string([]byte{0xff, 0xfe}): false,
+		"zero\u200bwidth": false, string([]byte{0xff, 0xfe}): false,
 	} {
 		if validName(name) != want {
 			t.Errorf("validName(%q) = %v, want %v", name, !want, want)

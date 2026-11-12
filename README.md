@@ -1,5 +1,7 @@
 # sabostack-go-server
 
+[![ci](https://github.com/Gegirhasut/sabostack-go-server/actions/workflows/ci.yml/badge.svg)](https://github.com/Gegirhasut/sabostack-go-server/actions/workflows/ci.yml)
+
 Игровой сервер на Go для real-time PvP 1 на 1 с падающими блоками: авторитетный сервер,
 модель акторов, бинарный протокол с дельтами, переподключение без потери матча,
 восстановление после падения процесса и кластер из нескольких узлов, который переживает
@@ -175,7 +177,7 @@ JSON-кадры, тип в поле `type`. Клиент, запросивший
 
 ## Запуск
 
-Нужен Go 1.22 или новее.
+Нужен Go 1.25 или новее.
 
 ```sh
 go run ./cmd/server                        # :8080, хранилище в памяти
@@ -242,6 +244,12 @@ go run ./cmd/server -addr :8082 -redis localhost:6379 -node-id game-2 -public-ur
 go test -race ./...
 go test -run '^$' -fuzz FuzzDecodeState ./internal/wire
 ```
+
+[CI](.github/workflows/ci.yml) на каждый push:
+- `gofmt`, `go mod tidy`, `go vet`, `staticcheck`, `govulncheck`;
+- `go test -race -count=2` на минимальной версии Go из `go.mod` и на текущей;
+- по 30 с fuzzing каждого декодера;
+- сборка Docker-образа и запуск с проверкой `/healthz`.
 
 99 тестов и 2 fuzz-цели. Конкурентные и кластерные тесты прогонялись многократно
 (`-count=20…300`), чтобы исключить нестабильность.
