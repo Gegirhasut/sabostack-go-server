@@ -446,9 +446,18 @@ func (m *Manager) persistLoop(sh *persistShard) {
 			sh.mu.Unlock()
 			return
 		}
-		jobs := make([]*persistJob, 0, min(len(sh.pending), m.opts.PersistBatch))
-		sh.urgent = sh.take(sh.urgent, &jobs, m.opts.PersistBatch)
-		sh.order = sh.take(sh.order, &jobs, m.opts.PersistBatch)
+		batch := m.opts.PersistBatch
+		jobs := make([]*persistJob, 0, min(len(sh.pending), batch))
+		// Urgent writes get at most half a batch while routine ones wait, so a steady
+		// stream of new matches cannot starve the periodic snapshots of a shard; any room
+		// the routine ones leave goes back to urgent.
+		urgentShare := batch
+		if len(sh.order) > 0 {
+			urgentShare = max(1, batch/2)
+		}
+		sh.urgent = sh.take(sh.urgent, &jobs, urgentShare)
+		sh.order = sh.take(sh.order, &jobs, batch)
+		sh.urgent = sh.take(sh.urgent, &jobs, batch)
 		sh.mu.Unlock()
 		n := len(jobs)
 		m.metrics.PersistPending.Sub(float64(n))

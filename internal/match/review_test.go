@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -206,5 +207,44 @@ func TestReviewAwaitedWriteSkipsTheQueue(t *testing.T) {
 	// Written in the first batch after the one in flight, not after 200 routine writes.
 	if pos < 0 || pos > opts.PersistBatch {
 		t.Fatalf("awaited write was write #%d of %d", pos, len(st.order))
+	}
+}
+
+// Fifth review, note 2: with more awaited writes than a batch holds arriving all the
+// time, routine snapshots on that shard would have waited indefinitely. Awaited writes
+// now take at most half a batch while routine ones are queued.
+func TestReviewAwaitedWritesDoNotStarveRoutineOnes(t *testing.T) {
+	st := &gatedStore{plainStore: newPlain(), gate: make(chan struct{})}
+	opts := DefaultOptions()
+	opts.PersistWorkers, opts.PersistBatch = 1, 8
+	mgr := NewManager(opts, clock.Real{}, st, metrics.New(prometheus.NewRegistry()), slog.New(slog.NewTextHandler(io.Discard, nil)))
+	defer mgr.Shutdown(context.Background())
+	sh := mgr.shards[0]
+	queued := func() int { sh.mu.Lock(); defer sh.mu.Unlock(); return len(sh.pending) }
+
+	mgr.save("in-flight", []byte("x"), false)
+	eventually(t, "writer busy", func() bool { return queued() == 0 })
+	for i := 0; i < 20; i++ {
+		mgr.save(fmt.Sprintf("routine-%02d", i), []byte("x"), false)
+	}
+	var wg sync.WaitGroup
+	for i := 0; i < 50; i++ { // a burst of new matches, each waiting for its write
+		wg.Add(1)
+		go func(i int) { defer wg.Done(); mgr.save(fmt.Sprintf("awaited-%02d", i), []byte("x"), true) }(i)
+	}
+	eventually(t, "burst queued", func() bool { return queued() == 70 })
+	close(st.gate)
+	wg.Wait()
+
+	st.mu.Lock()
+	defer st.mu.Unlock()
+	routine := 0
+	for _, id := range st.order[1 : 1+opts.PersistBatch] { // the first batch after the one in flight
+		if strings.HasPrefix(id, "routine-") {
+			routine++
+		}
+	}
+	if routine < opts.PersistBatch/2 {
+		t.Fatalf("first batch after the burst had %d routine writes of %d: %v", routine, opts.PersistBatch, st.order[1:1+opts.PersistBatch])
 	}
 }
