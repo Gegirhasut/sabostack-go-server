@@ -1,0 +1,67 @@
+# Three game servers sharing one Redis: shared matchmaking, cross-node redirects and
+# takeover of a crashed node's matches. See docs/CLUSTER.md.
+#
+#   docker compose -f docker-compose.cluster.yml up -d --build
+#   docker compose -f docker-compose.cluster.yml run --rm bot      # load across all nodes
+#   scripts/cluster-failover.sh                                    # kill a node mid-load
+x-game: &game
+  build: .
+  depends_on:
+    redis:
+      condition: service_healthy
+  stop_grace_period: 20s
+  restart: "no"
+
+services:
+  redis:
+    image: redis:7-alpine
+    command: ["redis-server", "--save", "", "--appendonly", "no"]
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 2s
+      timeout: 2s
+      retries: 10
+
+  game-1:
+    <<: *game
+    environment: &env1
+      ADDR: ":8080"
+      REDIS_ADDR: "redis:6379"
+      NODE_ID: "game-1"
+      PUBLIC_URL: "ws://game-1:8080/ws"
+    ports: ["8081:8080"]
+
+  game-2:
+    <<: *game
+    environment:
+      <<: *env1
+      NODE_ID: "game-2"
+      PUBLIC_URL: "ws://game-2:8080/ws"
+    ports: ["8082:8080"]
+
+  game-3:
+    <<: *game
+    environment:
+      <<: *env1
+      NODE_ID: "game-3"
+      PUBLIC_URL: "ws://game-3:8080/ws"
+    ports: ["8083:8080"]
+
+  # Load generator: bots join through all three nodes (like a load balancer would spread
+  # them), follow redirects, and resume after a node dies.
+  bot:
+    build: .
+    profiles: ["load"]
+    entrypoint: ["/usr/local/bin/bot"]
+    command:
+      - -url=ws://game-1:8080/ws,ws://game-2:8080/ws,ws://game-3:8080/ws
+      - -metrics=http://game-1:8080/metrics,http://game-2:8080/metrics,http://game-3:8080/metrics
+      - -proto=bin
+      - -resume-on-drop
+      - -pairs=300
+      - -duration=60s
+      - -warmup=10s
+      - -json=/out/cluster.json
+    volumes:
+      - ./docs/loadtest/cluster:/out
+    depends_on: [game-1, game-2, game-3]

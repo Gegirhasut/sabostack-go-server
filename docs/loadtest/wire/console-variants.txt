@@ -1,0 +1,312 @@
+uname: Linux 6.6.87.2-microsoft-standard-WSL2, nproc: 8, duration: 60s, variants: stage1 json bin-full bin
+=== stage1-1000 (stage1, 1000 pairs) 2026-11-12T22:37:37+02:00
+bot exit: 0
+matches finished:   3036
+errors / dropped:   0 / 0
+messages received:  539890 (8998/s, 446.9 MB); inputs sent: 12.9 MB (json)
+input->ack latency: p50=27.0ms p95=50.2ms p99=89.0ms max=266.0ms (n=290527)
+server CPU:         179.8% of one core
+server RSS:         avg 185.4 MB, max 189.1 MB (start 168.6, end 185.3)
+server tick:        mean 10.5µs, max 86.58ms
+bot_max_rss_kb=123264 bot_cpu_user_s=74.01 bot_cpu_sys_s=49.57
+bot stderr lines (errors): 0
+server exit code: 0, shutdown took .052846188s
+server_error_log_lines=0
+host load: 31.04 29.35 29.39
+=== json-1000 (json, 1000 pairs) 2026-11-12T22:38:56+02:00
+bot exit: 0
+matches finished:   3020
+errors / dropped:   0 / 0
+messages received:  541933 (9032/s, 449.0 MB); inputs sent: 12.9 MB (json)
+input->ack latency: p50=26.7ms p95=49.4ms p99=62.8ms max=162.2ms (n=291544)
+server CPU:         171.4% of one core
+server RSS:         avg 191.5 MB, max 194.4 MB (start 174.5, end 194.4)
+server tick:        mean 7.5µs, max 63.74ms
+server traffic:     3.72 KB/s out, 0.11 KB/s in per client
+bot_max_rss_kb=123492 bot_cpu_user_s=71.54 bot_cpu_sys_s=49.25
+bot stderr lines (errors): 0
+server exit code: 0, shutdown took .044312197s
+server_error_log_lines=0
+host load: 32.26 30.08 29.64
+=== bin-full-1000 (bin-full, 1000 pairs) 2026-11-12T22:40:15+02:00
+bot exit: 0
+matches finished:   3010
+errors / dropped:   0 / 0
+messages received:  550492 (9175/s, 124.5 MB); inputs sent: 0.9 MB (bin)
+input->ack latency: p50=26.1ms p95=48.5ms p99=50.8ms max=94.9ms (n=293539)
+server CPU:         157.7% of one core
+server RSS:         avg 205.4 MB, max 209.8 MB (start 180.1, end 208.3)
+server tick:        mean 5.4µs, max 52.45ms
+server traffic:     1.03 KB/s out, 0.01 KB/s in per client
+bot_max_rss_kb=131584 bot_cpu_user_s=46.48 bot_cpu_sys_s=54.46
+bot stderr lines (errors): 0
+server exit code: 0, shutdown took .050139354s
+server_error_log_lines=0
+host load: 31.48 30.22 29.72
+=== bin-1000 (bin, 1000 pairs) 2026-11-12T22:41:33+02:00
+bot exit: 0
+matches finished:   3015
+errors / dropped:   0 / 0
+messages received:  549013 (9150/s, 25.1 MB); inputs sent: 0.9 MB (bin)
+input->ack latency: p50=26.0ms p95=48.6ms p99=51.8ms max=148.4ms (n=292813)
+server CPU:         162.1% of one core
+server RSS:         avg 201.1 MB, max 207.1 MB (start 179.6, end 202.8)
+server tick:        mean 5.8µs, max 28.48ms
+server traffic:     0.20 KB/s out, 0.01 KB/s in per client
+bot_max_rss_kb=127208 bot_cpu_user_s=46.37 bot_cpu_sys_s=54.31
+bot stderr lines (errors): 0
+server exit code: 0, shutdown took .070402646s
+server_error_log_lines=0
+host load: 31.77 30.47 29.84
+=== stage1-2000 (stage1, 2000 pairs) 2026-11-12T22:42:52+02:00
+bot exit: 0
+matches finished:   5727
+errors / dropped:   0 / 0
+messages received:  1065685 (17739/s, 886.4 MB); inputs sent: 24.9 MB (json)
+input->ack latency: p50=42.4ms p95=280.8ms p99=688.2ms max=2267.7ms (n=563228)
+server CPU:         304.7% of one core
+server RSS:         avg 330.1 MB, max 331.5 MB (start 319.3, end 331.5)
+server tick:        mean 45.5µs, max 353.26ms
+bot_max_rss_kb=226072 bot_cpu_user_s=142.32 bot_cpu_sys_s=61.21
+bot stderr lines (errors): 0
+server exit code: 0, shutdown took .141579172s
+server_error_log_lines=0
+host load: 33.52 31.38 30.22
+=== json-2000 (json, 2000 pairs) 2026-11-12T22:44:20+02:00
+bot exit: 0
+matches finished:   5782
+errors / dropped:   0 / 0
+messages received:  1089111 (18152/s, 907.0 MB); inputs sent: 25.4 MB (json)
+input->ack latency: p50=42.4ms p95=257.3ms p99=671.8ms max=1632.3ms (n=573659)
+server CPU:         287.3% of one core
+server RSS:         avg 349.6 MB, max 351.9 MB (start 333.7, end 351.9)
+server tick:        mean 29.4µs, max 178.30ms
+server traffic:     3.74 KB/s out, 0.10 KB/s in per client
+bot_max_rss_kb=230124 bot_cpu_user_s=129.74 bot_cpu_sys_s=59.77
+bot stderr lines (errors): 0
+server exit code: 0, shutdown took .077048726s
+server_error_log_lines=0
+host load: 34.42 32.17 30.60
+=== bin-full-2000 (bin-full, 2000 pairs) 2026-11-12T22:45:42+02:00
+bot exit: 0
+matches finished:   5935
+errors / dropped:   0 / 0
+messages received:  1099611 (18324/s, 248.7 MB); inputs sent: 1.8 MB (bin)
+input->ack latency: p50=29.3ms p95=72.0ms p99=153.2ms max=477.2ms (n=589866)
+server CPU:         260.9% of one core
+server RSS:         avg 373.6 MB, max 378.0 MB (start 353.7, end 378.0)
+server tick:        mean 18.3µs, max 124.35ms
+server traffic:     1.02 KB/s out, 0.01 KB/s in per client
+bot_max_rss_kb=242932 bot_cpu_user_s=81.84 bot_cpu_sys_s=74.06
+bot stderr lines (errors): 0
+server exit code: 0, shutdown took .087606565s
+server_error_log_lines=0
+host load: 34.19 32.60 30.87
+=== bin-2000 (bin, 2000 pairs) 2026-11-12T22:47:03+02:00
+bot exit: 0
+matches finished:   5940
+errors / dropped:   0 / 0
+messages received:  1090572 (18176/s, 49.6 MB); inputs sent: 1.8 MB (bin)
+input->ack latency: p50=32.1ms p95=119.3ms p99=247.7ms max=637.3ms (n=584659)
+server CPU:         270.4% of one core
+server RSS:         avg 375.8 MB, max 382.0 MB (start 347.2, end 376.9)
+server tick:        mean 31.7µs, max 328.81ms
+server traffic:     0.20 KB/s out, 0.01 KB/s in per client
+bot_max_rss_kb=237440 bot_cpu_user_s=81.16 bot_cpu_sys_s=73.66
+bot stderr lines (errors): 0
+server exit code: 0, shutdown took .091790277s
+server_error_log_lines=0
+host load: 34.29 33.02 31.16
+=== stage1-3000 (stage1, 3000 pairs) 2026-11-12T22:48:25+02:00
+bot exit: 0
+matches finished:   6867
+errors / dropped:   538 / 2
+messages received:  1542836 (25712/s, 1310.5 MB); inputs sent: 32.9 MB (json)
+input->ack latency: p50=399.4ms p95=4340.9ms p99=6240.9ms max=13622.9ms (n=730800)
+server CPU:         381.6% of one core
+server RSS:         avg 458.8 MB, max 471.2 MB (start 457.8, end 471.2)
+server tick:        mean 108.0µs, max 413.15ms
+bot_max_rss_kb=374208 bot_cpu_user_s=155.92 bot_cpu_sys_s=52.84
+bot stderr lines (errors): 553
+server exit code: 0, shutdown took .137217361s
+server_error_log_lines=0
+host load: 36.54 34.12 31.73
+=== json-3000 (json, 3000 pairs) 2026-11-12T22:49:53+02:00
+uname: Linux 6.6.87.2-microsoft-standard-WSL2, nproc: 8, duration: 60s, variants: stage1 json bin-full bin
+=== stage1-3000 (stage1, 3000 pairs) 2026-11-12T23:07:40+02:00
+bot exit: 0
+matches finished:   8027
+errors / dropped:   8 / 2
+messages received:  1618032 (26967/s, 1357.8 MB); inputs sent: 35.9 MB (json)
+input->ack latency: p50=135.6ms p95=1457.8ms p99=2374.0ms max=5475.8ms (n=821324)
+server CPU:         351.9% of one core
+server RSS:         avg 479.7 MB, max 481.4 MB (start 467.2, end 481.4)
+server tick:        mean 76.2µs, max 276.28ms
+bot_max_rss_kb=349512 bot_cpu_user_s=154.09 bot_cpu_sys_s=56.47
+bot stderr lines (errors): 10
+server exit code: 0, shutdown took .075821862s
+server_error_log_lines=0
+host load: 34.37 28.91 28.80
+=== json-3000 (json, 3000 pairs) 2026-11-12T23:09:08+02:00
+bot exit: 0
+matches finished:   8959
+errors / dropped:   0 / 0
+messages received:  1623113 (27052/s, 1348.2 MB); inputs sent: 38.1 MB (json)
+input->ack latency: p50=37.7ms p95=148.3ms p99=396.7ms max=1192.8ms (n=861707)
+server CPU:         310.0% of one core
+server RSS:         avg 501.5 MB, max 504.7 MB (start 478.9, end 504.7)
+server tick:        mean 24.9µs, max 190.31ms
+server traffic:     3.70 KB/s out, 0.10 KB/s in per client
+bot_max_rss_kb=338048 bot_cpu_user_s=144.48 bot_cpu_sys_s=67.47
+bot stderr lines (errors): 0
+server exit code: 0, shutdown took .087366604s
+server_error_log_lines=0
+host load: 33.75 30.00 29.19
+=== bin-full-3000 (bin-full, 3000 pairs) 2026-11-12T23:10:33+02:00
+bot exit: 0
+matches finished:   8990
+errors / dropped:   0 / 0
+messages received:  1625546 (27092/s, 367.6 MB); inputs sent: 2.6 MB (bin)
+input->ack latency: p50=30.9ms p95=97.6ms p99=201.0ms max=921.9ms (n=867965)
+server CPU:         300.9% of one core
+server RSS:         avg 525.9 MB, max 533.6 MB (start 493.2, end 533.6)
+server tick:        mean 12.1µs, max 188.42ms
+server traffic:     1.01 KB/s out, 0.01 KB/s in per client
+bot_max_rss_kb=337752 bot_cpu_user_s=97.12 bot_cpu_sys_s=82.05
+bot stderr lines (errors): 0
+server exit code: 0, shutdown took .086416297s
+server_error_log_lines=0
+host load: 34.08 31.00 29.61
+=== bin-3000 (bin, 3000 pairs) 2026-11-12T23:11:58+02:00
+bot exit: 0
+matches finished:   8941
+errors / dropped:   0 / 0
+messages received:  1625722 (27095/s, 73.8 MB); inputs sent: 2.6 MB (bin)
+input->ack latency: p50=38.8ms p95=138.2ms p99=242.4ms max=1545.0ms (n=855026)
+server CPU:         314.6% of one core
+server RSS:         avg 523.4 MB, max 530.2 MB (start 492.0, end 530.2)
+server tick:        mean 10.4µs, max 206.50ms
+server traffic:     0.20 KB/s out, 0.01 KB/s in per client
+bot_max_rss_kb=341224 bot_cpu_user_s=94.95 bot_cpu_sys_s=76.31
+bot stderr lines (errors): 0
+server exit code: 0, shutdown took .089821921s
+server_error_log_lines=0
+host load: 34.95 32.03 30.10
+=== stage1-2000-r2 (stage1, 2000 pairs) 2026-11-12T23:13:23+02:00
+bot exit: 0
+matches finished:   5858
+errors / dropped:   0 / 0
+messages received:  1086137 (18102/s, 903.1 MB); inputs sent: 25.6 MB (json)
+input->ack latency: p50=34.2ms p95=188.2ms p99=559.7ms max=1434.5ms (n=578795)
+server CPU:         277.8% of one core
+server RSS:         avg 334.9 MB, max 337.1 MB (start 320.1, end 337.1)
+server tick:        mean 34.0µs, max 165.77ms
+bot_max_rss_kb=231840 bot_cpu_user_s=119.13 bot_cpu_sys_s=62.37
+bot stderr lines (errors): 0
+server exit code: 0, shutdown took .086267560s
+server_error_log_lines=0
+host load: 34.88 32.64 30.47
+=== json-2000-r2 (json, 2000 pairs) 2026-11-12T23:14:44+02:00
+bot exit: 0
+matches finished:   5939
+errors / dropped:   0 / 0
+messages received:  1107655 (18460/s, 921.0 MB); inputs sent: 26.2 MB (json)
+input->ack latency: p50=29.0ms p95=65.3ms p99=133.0ms max=647.4ms (n=592707)
+server CPU:         250.4% of one core
+server RSS:         avg 350.7 MB, max 354.5 MB (start 321.5, end 354.5)
+server tick:        mean 15.7µs, max 77.84ms
+server traffic:     3.79 KB/s out, 0.11 KB/s in per client
+bot_max_rss_kb=228196 bot_cpu_user_s=115.20 bot_cpu_sys_s=64.97
+bot stderr lines (errors): 0
+server exit code: 0, shutdown took .064341310s
+server_error_log_lines=0
+host load: 34.46 32.95 30.75
+=== bin-full-2000-r2 (bin-full, 2000 pairs) 2026-11-12T23:16:06+02:00
+bot exit: 0
+matches finished:   5933
+errors / dropped:   0 / 0
+messages received:  1109042 (18484/s, 250.8 MB); inputs sent: 1.8 MB (bin)
+input->ack latency: p50=26.0ms p95=48.9ms p99=58.5ms max=177.0ms (n=597592)
+server CPU:         222.3% of one core
+server RSS:         avg 374.5 MB, max 378.5 MB (start 340.4, end 378.5)
+server tick:        mean 5.8µs, max 61.41ms
+server traffic:     1.03 KB/s out, 0.01 KB/s in per client
+bot_max_rss_kb=239572 bot_cpu_user_s=70.72 bot_cpu_sys_s=75.94
+bot stderr lines (errors): 0
+server exit code: 0, shutdown took .081310503s
+server_error_log_lines=0
+host load: 33.90 32.94 30.93
+=== bin-2000-r2 (bin, 2000 pairs) 2026-11-12T23:17:28+02:00
+bot exit: 0
+matches finished:   5928
+errors / dropped:   0 / 0
+messages received:  1109453 (18491/s, 50.2 MB); inputs sent: 1.8 MB (bin)
+input->ack latency: p50=26.2ms p95=48.8ms p99=54.6ms max=154.9ms (n=596199)
+server CPU:         223.2% of one core
+server RSS:         avg 371.9 MB, max 377.3 MB (start 350.0, end 377.3)
+server tick:        mean 6.9µs, max 85.01ms
+server traffic:     0.20 KB/s out, 0.01 KB/s in per client
+bot_max_rss_kb=238592 bot_cpu_user_s=69.19 bot_cpu_sys_s=76.09
+bot stderr lines (errors): 0
+server exit code: 0, shutdown took .061692818s
+server_error_log_lines=0
+host load: 34.90 33.41 31.26
+=== stage1-3000-r2 (stage1, 3000 pairs) 2026-11-12T23:18:49+02:00
+bot exit: 0
+matches finished:   8854
+errors / dropped:   0 / 0
+messages received:  1613134 (26886/s, 1339.8 MB); inputs sent: 37.9 MB (json)
+input->ack latency: p50=39.6ms p95=177.9ms p99=341.2ms max=958.5ms (n=858582)
+server CPU:         323.8% of one core
+server RSS:         avg 480.9 MB, max 483.0 MB (start 463.1, end 483.0)
+server tick:        mean 36.7µs, max 145.82ms
+bot_max_rss_kb=330240 bot_cpu_user_s=144.88 bot_cpu_sys_s=65.34
+bot stderr lines (errors): 0
+server exit code: 0, shutdown took .101868222s
+server_error_log_lines=0
+host load: 35.91 34.05 31.67
+=== json-3000-r2 (json, 3000 pairs) 2026-11-12T23:20:15+02:00
+bot exit: 0
+matches finished:   8921
+errors / dropped:   0 / 0
+messages received:  1617444 (26957/s, 1343.3 MB); inputs sent: 38.0 MB (json)
+input->ack latency: p50=36.2ms p95=159.4ms p99=331.9ms max=1363.5ms (n=859896)
+server CPU:         314.0% of one core
+server RSS:         avg 498.0 MB, max 502.1 MB (start 477.0, end 502.1)
+server tick:        mean 20.5µs, max 202.43ms
+server traffic:     3.69 KB/s out, 0.10 KB/s in per client
+bot_max_rss_kb=332660 bot_cpu_user_s=151.78 bot_cpu_sys_s=71.04
+bot stderr lines (errors): 0
+server exit code: 0, shutdown took .079585794s
+server_error_log_lines=0
+host load: 37.04 34.78 32.13
+=== bin-full-3000-r2 (bin-full, 3000 pairs) 2026-11-12T23:21:40+02:00
+bot exit: 0
+matches finished:   8987
+errors / dropped:   0 / 0
+messages received:  1631448 (27191/s, 368.9 MB); inputs sent: 2.6 MB (bin)
+input->ack latency: p50=28.5ms p95=63.1ms p99=111.7ms max=294.5ms (n=873151)
+server CPU:         285.6% of one core
+server RSS:         avg 523.5 MB, max 529.8 MB (start 478.7, end 529.8)
+server tick:        mean 8.3µs, max 72.89ms
+server traffic:     1.01 KB/s out, 0.01 KB/s in per client
+bot_max_rss_kb=335872 bot_cpu_user_s=94.86 bot_cpu_sys_s=83.93
+bot stderr lines (errors): 0
+server exit code: 0, shutdown took .080865529s
+server_error_log_lines=0
+host load: 36.21 34.92 32.41
+=== bin-3000-r2 (bin, 3000 pairs) 2026-11-12T23:23:05+02:00
+bot exit: 0
+matches finished:   8960
+errors / dropped:   0 / 0
+messages received:  1626127 (27102/s, 73.9 MB); inputs sent: 2.6 MB (bin)
+input->ack latency: p50=36.8ms p95=131.7ms p99=244.0ms max=865.5ms (n=857375)
+server CPU:         313.5% of one core
+server RSS:         avg 522.8 MB, max 530.5 MB (start 495.4, end 530.5)
+server tick:        mean 12.6µs, max 176.48ms
+server traffic:     0.20 KB/s out, 0.01 KB/s in per client
+bot_max_rss_kb=341120 bot_cpu_user_s=96.07 bot_cpu_sys_s=79.69
+bot stderr lines (errors): 0
+server exit code: 0, shutdown took .093299896s
+server_error_log_lines=0
+host load: 35.15 34.85 32.60

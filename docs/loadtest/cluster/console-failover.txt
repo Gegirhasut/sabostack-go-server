@@ -1,0 +1,27 @@
+=== 2026-11-12T20:36:10Z killing game-2 (SIGKILL)
+ Container sabostack-go-server-game-2-1 Killed 
+=== bot report
+bots:               600 (300 pairs)
+ramp / measured:    1.7s / 60.0s
+matches finished:   856
+errors / dropped:   0 / 0
+violations:         0
+cross-server:       1574 redirects; drops resumed 176, lost 0; drop->resumed p50=9259ms p95=12644ms max=13129ms
+inputs sent:        84410
+messages received:  155510 (2592/s, 7.4 MB); inputs sent: 0.3 MB (bin)
+input->ack latency: p50=24.9ms p95=48.4ms p99=50.7ms max=13177.2ms (n=84471)
+server connections: avg 575, min 409; live matches avg 289 (420 incl. lingering)
+server CPU:         97.5% of one core
+server RSS:         avg 104.1 MB, max 118.2 MB (start 104.7, end 97.1)
+server goroutines:  avg 2192 (start 2154, end 2246)
+server tick:        mean 4.7µs, max 14.32ms
+server traffic:     0.17 KB/s out, 0.01 KB/s in per client
+=== invariant violations reported by bots: 0
+=== takeover on the surviving nodes
+{"time":"2026-11-12T20:35:18.069500026Z","level":"INFO","msg":"cluster mode","node":"game-3","url":"ws://game-3:8080/ws","lease":10000000000,"sharedQueue":true}
+{"time":"2026-11-12T20:35:18.608447668Z","level":"INFO","msg":"cluster mode","node":"game-1","url":"ws://game-1:8080/ws","lease":10000000000,"sharedQueue":true}
+{"time":"2026-11-12T20:36:20.096034997Z","level":"INFO","msg":"adopted matches from dead nodes","count":50}
+{"time":"2026-11-12T20:36:20.621668853Z","level":"INFO","msg":"adopted matches from dead nodes","count":38}
+matches adopted per node:
+  game-1: 38
+  game-3: 50
