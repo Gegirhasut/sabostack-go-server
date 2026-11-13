@@ -5,6 +5,7 @@ import (
 	"context"
 	"errors"
 	"flag"
+	"fmt"
 	"log/slog"
 	"net/http"
 	"os"
@@ -87,6 +88,10 @@ func main() {
 	c.srv.PublicMetrics = c.adminAddr == "" || c.publicMetrics
 
 	log := newLogger(c.logLevel, c.logJSON)
+	if err := checkTimings(c.srv, c.opts.Match); err != nil {
+		log.Error("bad timing flags", "err", err)
+		os.Exit(2)
+	}
 	if err := run(log, c); err != nil {
 		log.Error("server failed", "err", err)
 		os.Exit(1)
@@ -141,10 +146,6 @@ func run(log *slog.Logger, c config) error {
 	}
 	if c.srv.PublicMetrics {
 		log.Warn("/metrics is served on the public address (set -admin-addr and -public-metrics=false in production)")
-	}
-
-	if m := c.opts.Match; m.SilenceTimeout > 0 && c.srv.PingInterval*2 > m.SilenceTimeout {
-		log.Warn("-ping-interval is over half of -silence-timeout: players who are connected but not moving will be marked disconnected")
 	}
 
 	mgr := match.NewManager(c.opts, clock.Real{}, st, met, log)
@@ -241,6 +242,36 @@ func run(log *slog.Logger, c config) error {
 	}
 	log.Info("shutdown complete")
 	return nil
+}
+
+// checkTimings refuses timing flags that break the disconnect rules instead of warning
+// about them: each of these quietly brings back a bug the defaults were chosen to avoid.
+func checkTimings(srv server.Config, m match.Config) error {
+	var errs []error
+	bad := func(format string, args ...any) { errs = append(errs, fmt.Errorf(format, args...)) }
+	if srv.PingInterval <= 0 || srv.PingInterval >= srv.PongWait {
+		bad("-ping-interval %s must be positive and under -pong-wait %s, or live sockets are closed", srv.PingInterval, srv.PongWait)
+	}
+	// How long a dropped connection still counts as a connected player.
+	noticed := srv.PongWait
+	if m.SilenceTimeout > 0 {
+		noticed = min(noticed, m.SilenceTimeout)
+		// A quiet client is heard only through its pongs; the seat comes back after a
+		// steady SilenceTimeout/2 without a gap that long.
+		if srv.PingInterval*2 >= m.SilenceTimeout {
+			bad("-ping-interval %s must be under half of -silence-timeout %s, or players who are connected but not moving are marked away and never back", srv.PingInterval, m.SilenceTimeout)
+		}
+	}
+	if noticed >= m.IdleTimeout {
+		bad("a dropped connection is noticed after %s (-silence-timeout, or -pong-wait when it is 0), not before -idle-timeout %s: the player would lose by idle before their reconnect grace starts", noticed, m.IdleTimeout)
+	}
+	if m.ReconnectGrace <= 0 {
+		bad("-reconnect-grace %s must be positive", m.ReconnectGrace)
+	}
+	if m.ResyncWait >= m.ReconnectGrace {
+		bad("-resync-wait %s must be under -reconnect-grace %s, or a player still finding the new node forfeits the moment the match resumes", m.ResyncWait, m.ReconnectGrace)
+	}
+	return errors.Join(errs...)
 }
 
 func newLogger(level string, json bool) *slog.Logger {
