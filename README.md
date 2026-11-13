@@ -27,9 +27,9 @@ One laptop, WSL2 with 8 vCPUs, server and bots on the same machine (methodology 
   errors. On a rolling deploy (SIGTERM): 206 of 206 within 3.9 s, with no lost progress
   ([CLUSTER.md](docs/CLUSTER.md)).
 - **~76 KB of memory and ~0.05 % of a core per player.** CPU is the limit, not memory.
-- **123 tests and 2 fuzz targets, all passing under `-race`.** 13 tests reproduce bugs
+- **125 tests and 2 fuzz targets, all passing under `-race`.** 13 tests reproduce bugs
   found while hardening: each fails on the code before the fix and passes after it
-  ([HARDENING.md](docs/HARDENING.md)). 31 more cover defects found later
+  ([HARDENING.md](docs/HARDENING.md)). 33 more cover defects found later
   ([HARDENING.md](docs/HARDENING.md#найдено-позже)). The store and cluster tests run
   against both miniredis and a real Redis. The load bot checks protocol invariants on
   every frame: 0 violations in the final runs.
@@ -56,7 +56,7 @@ The detailed documents are in Russian.
 | Binary protocol | `internal/wire`, `internal/server/conn.go` | Subprotocol `sabostack.bin.v1`. The delta is computed in the writer goroutine against what was *actually* sent to the client, so it stays consistent with outbox conflation and reconnects. Fuzzing found and closed a decoder crash. |
 | Timers | `Match.Advance`, `internal/clock` | 20 Hz tick; every timer is a deadline on a swappable clock, so tests are deterministic. |
 | Reconnection | `Match.Attach`, `Match.Advance` | A session token (only its SHA-256 is stored); the first message is a snapshot with the missed events. The match never pauses: a dropped player's board keeps falling while the opponent plays on, and they have 20 s to resume or forfeit. |
-| Connection loss | `Match.Advance`, `internal/server/conn.go` | A half-open connection is noticed by silence, by the match on its own tick: 8 s without a message or a pong marks the seat away and starts the grace, while the socket stays open in case the client was only slow. It comes back after 4 s of steady contact (hysteresis, so a stalling connection does not flap). What a client does on its side: [client contract](docs/ARCHITECTURE.md#контракт-клиента--потеря-соединения). |
+| Connection loss | `Match.Advance`, `internal/server/conn.go` | A half-open connection is noticed by silence, by the match on its own tick: 8 s without a message or a pong marks the seat away and starts the grace, while the socket stays open in case the client was only slow. It comes back after 4 s of steady contact (hysteresis, so a stalling connection does not flap); an input brings it back at once. What a client does on its side: [client contract](docs/ARCHITECTURE.md#контракт-клиента--потеря-соединения). |
 | Crash recovery | `snapshot.go`, `manager.go` | Snapshots are written by several persisters with coalescing and pipelined batches, behind a circuit breaker for Redis outages. After a rewind to a snapshot, event numbers are never reused. |
 | Cluster | `internal/cluster`, `internal/store/cluster.go` | A one-key lease per node, batched takeover of a dead node's matches under a lock, Lua fencing of the owner, self-fencing on Redis loss, a shared matchmaking queue with pub/sub and redirects. |
 | Fault isolation | `Actor.run` | A panic in one match stops only that match. |
@@ -268,20 +268,20 @@ go test -run '^$' -fuzz FuzzDecodeState ./internal/wire
 - 30 s of fuzzing for each decoder;
 - a Docker image build and a run with a `/healthz` check.
 
-123 tests and 2 fuzz targets. The concurrency and cluster tests were run many times
+125 tests and 2 fuzz targets. The concurrency and cluster tests were run many times
 (`-count=20…300`) to rule out flakiness.
 
 - **Bug reproductions (13):** every bug found while hardening is covered by a test written
   against the old API: it fails with a meaningful message on the code before the fix and
   passes after it ([table](docs/HARDENING.md#баги-и-их-воспроизведение)).
-- **Defects found later (31):** IP spoofing via `X-Forwarded-For`, extra time before an
+- **Defects found later (33):** IP spoofing via `X-Forwarded-For`, extra time before an
   idle forfeit after reconnecting, self-fencing before the lease expires, retrying an
   unsaved snapshot, a leaving node is no redirect target, `pong` while queued, no double
   assignment in matchmaking, a `WaitGroup` race at shutdown, a zombie match on a fenced
   node, leaked tickets of players who left, a ghost ticket in the queue, a match is
   announced only after it is stored, snapshots of an unknown version are not deleted
   during a rollout, player tokens never reach Redis, a restored match waits for both
-  players, a stalling connection does not flap away/back, timing flags are checked at
+  players, a stalling connection does not flap away/back, silence is not idle time, an input brings a silent player back at once, timing flags are checked at
   startup, the snapshot version is bumped with a migration
   ([HARDENING.md](docs/HARDENING.md#найдено-позже)).
 - **Binary protocol:** 20,000 random round-trip steps, byte-for-byte equality of
