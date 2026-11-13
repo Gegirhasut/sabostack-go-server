@@ -52,7 +52,8 @@ type Config struct {
 	// most game.MaxLockResets times per piece (more after it reaches a new lowest row).
 	// Nothing else restarts it: a turn that lifts the piece leaves the timer running, and
 	// a piece still in the air when it runs out drops and locks LockDelay later at the
-	// latest. 0 = lock on contact.
+	// latest. 0 = lock on contact. Each new lowest row gives a fresh allowance, so on top
+	// of that no piece lives longer than PieceLimit (see there).
 	LockDelay      time.Duration
 	WinsNeeded     int // rounds needed to win the match
 	MaxRounds      int
@@ -129,7 +130,8 @@ type Seat struct {
 	LastSeq   uint64      `json:"lastSeq"`   // highest input seq consumed (idempotency)
 	Wins      int         `json:"wins"`
 	Board     *game.Board `json:"board"`
-	LockAt    time.Time   `json:"lockAt"` // when the resting piece locks (Config.LockDelay); zero while it falls
+	LockAt    time.Time   `json:"lockAt"`  // when the resting piece locks (Config.LockDelay); zero while it falls
+	PieceAt   time.Time   `json:"pieceAt"` // when the current piece appeared (Config.PieceLimit); zero until the next play step
 
 	sink       Sink
 	rewound    bool      // restored from a non-final snapshot; cleared by the next Attach
@@ -282,6 +284,7 @@ func (m *Match) resync(now time.Time) bool {
 	m.ResyncFrom, m.ResyncUntil = time.Time{}, time.Time{}
 	for _, s := range m.Seats {
 		shiftTime(&s.LockAt, stood)
+		shiftTime(&s.PieceAt, stood)
 		if s.Connected {
 			m.runIdle(s, now)
 		}
@@ -489,17 +492,23 @@ func later(a, b time.Time) time.Time {
 func (m *Match) play(now time.Time) {
 	// Gravity steps and locks run in the order they fall due, catching up if a tick ran
 	// late, but never looping unboundedly.
+	for _, s := range m.Seats {
+		if s.PieceAt.IsZero() { // the first piece of a round, or a snapshot without the field
+			s.PieceAt = now
+		}
+	}
 	for steps := 0; m.Phase == Playing && steps < 20; steps++ {
 		at, lock := m.NextGravity, NoSeat
 		for i, s := range m.Seats {
-			if s.LockAt.IsZero() {
-				continue
-			}
-			due := s.LockAt
-			if !s.Board.Grounded() {
-				// A turn lifted it: it locks as soon as it lands, and if a player keeps it
-				// in the air past one more delay, it is dropped.
-				due = due.Add(m.cfg.LockDelay)
+			due := s.PieceAt.Add(m.cfg.PieceLimit())
+			if !s.LockAt.IsZero() {
+				lockAt := s.LockAt
+				if !s.Board.Grounded() {
+					// A turn lifted it: it locks as soon as it lands, and if a player keeps
+					// it in the air past one more delay, it is dropped.
+					lockAt = lockAt.Add(m.cfg.LockDelay)
+				}
+				due = minTime(due, lockAt)
 			}
 			if due.Before(at) {
 				at, lock = due, i
@@ -509,7 +518,7 @@ func (m *Match) play(now time.Time) {
 			break
 		}
 		if lock != NoSeat {
-			m.handle(lock, m.Seats[lock].Board.Apply(game.HardDrop), now) // a resting piece drops 0 rows
+			m.handle(lock, m.Seats[lock].Board.Apply(game.HardDrop), now) // a resting piece drops 0 rows, an old one may fall first
 			continue
 		}
 		m.NextGravity = m.NextGravity.Add(m.cfg.Gravity)
@@ -642,8 +651,24 @@ func (m *Match) newBoards() {
 	pieceSeed := m.Seed + uint64(m.Round)*0x9e3779b97f4a7c15
 	for i, s := range m.Seats {
 		s.Board = game.NewBoard(pieceSeed, pieceSeed^uint64(i+1)*0xbf58476d1ce4e5b9)
-		s.LockAt = time.Time{}
+		s.LockAt, s.PieceAt = time.Time{}, time.Time{}
 	}
+}
+
+// PieceLimit is the longest a piece lives: the time to fall the whole field plus one
+// full lock delay allowance, (MaxLockResets+2) delays. Then it drops and locks. The lock
+// delay alone is bounded per row, and every new lowest row gives a fresh allowance, so
+// without this a piece walked down a staircase of ledges could outlive the round, and a
+// player ahead on points could sit it out: garbage only rises when a piece locks.
+func (c Config) PieceLimit() time.Duration {
+	return game.Height*c.Gravity + (game.MaxLockResets+2)*c.LockDelay
+}
+
+func minTime(a, b time.Time) time.Time {
+	if b.Before(a) {
+		return b
+	}
+	return a
 }
 
 // settle runs the lock delay of a seat after anything happened to its piece. The timer
@@ -657,6 +682,9 @@ func (m *Match) newBoards() {
 func (m *Match) settle(seat int, r game.Result, now time.Time) {
 	s := m.Seats[seat]
 	b := s.Board
+	if r.Locked {
+		s.PieceAt = now // the next piece
+	}
 	switch {
 	case b.Dead:
 		s.LockAt = time.Time{}

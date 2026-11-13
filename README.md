@@ -28,9 +28,9 @@ One laptop, WSL2 with 8 vCPUs, server and bots on the same machine (methodology 
   ([CLUSTER.md](docs/CLUSTER.md)).
 - **~76 KB of memory and ~0.05 % of a core per player** (the growth from 2,000 to 4,000
   connections in the [load table](#load-testing-summary)). CPU is the limit, not memory.
-- **136 tests and 2 fuzz targets, all passing under `-race`.** 13 tests reproduce bugs
+- **137 tests and 2 fuzz targets, all passing under `-race`.** 13 tests reproduce bugs
   found while hardening: each fails on the code before the fix and passes after it
-  ([HARDENING.md](docs/HARDENING.md)). 44 more cover defects found later
+  ([HARDENING.md](docs/HARDENING.md)). 45 more cover defects found later
   ([HARDENING.md](docs/HARDENING.md#найдено-позже)). The store and cluster tests run
   against both miniredis and a real Redis. The load bot checks protocol invariants on
   every frame: 0 violations in the final runs.
@@ -142,8 +142,11 @@ Details in [ARCHITECTURE.md](docs/ARCHITECTURE.md#отключения-матч-
   restarts the delay at most 15 times per piece; only a new lowest row of its bottom cell
   gives them back. A turn that lifts the piece does not stop the timer, and a piece kept
   in the air past its time is dropped. So nobody can hold a piece on the floor: under any
-  input it locks within (15 + 2) × 0.5 s of its last new lowest row. `soft_drop` never locks; `hard_drop`
-  locks at once.
+  input it locks within (15 + 2) × 0.5 s of its last new lowest row. And since every new
+  lowest row gives a fresh allowance, no piece lives longer than the time to fall the
+  whole field plus one allowance (20 × 0.5 s + 17 × 0.5 s = 18.5 s with the defaults):
+  then it drops and locks, so even a staircase of ledges cannot stretch it out.
+  `soft_drop` never locks; `hard_drop` locks at once.
 - Clearing 2, 3 or 4 lines sends the opponent 1, 2 or 4 garbage rows; your own clears
   cancel incoming garbage first. Garbage that pushes your stack above the top is a
   top-out, like a piece that cannot spawn.
@@ -283,13 +286,13 @@ go test -run '^$' -fuzz FuzzDecodeState ./internal/wire
 - 30 s of fuzzing for each decoder;
 - a Docker image build and a run with a `/healthz` check.
 
-136 tests and 2 fuzz targets. The concurrency and cluster tests were run many times
+137 tests and 2 fuzz targets. The concurrency and cluster tests were run many times
 (`-count=20…300`) to rule out flakiness.
 
 - **Bug reproductions (13):** every bug found while hardening is covered by a test written
   against the old API: it fails with a meaningful message on the code before the fix and
   passes after it ([table](docs/HARDENING.md#баги-и-их-воспроизведение)).
-- **Defects found later (44):** IP spoofing via `X-Forwarded-For`, extra time before an
+- **Defects found later (45):** IP spoofing via `X-Forwarded-For`, extra time before an
   idle forfeit after reconnecting, self-fencing before the lease expires, retrying an
   unsaved snapshot, a leaving node is no redirect target, `pong` while queued, no double
   assignment in matchmaking, a `WaitGroup` race at shutdown, a zombie match on a fenced
@@ -298,7 +301,8 @@ go test -run '^$' -fuzz FuzzDecodeState ./internal/wire
   during a rollout, player tokens never reach Redis, a restored match waits for both
   players, a stalling connection does not flap away/back, silence is not idle time, an input brings a silent player back at once, timing flags are checked at
   startup, the snapshot version is bumped with a migration, a lock delay with bounded
-  resets (turning back and forth on the floor cannot hold a piece), SRS kicks in both directions, garbage pushed above the top is a top-out
+  resets (turning back and forth on the floor or walking down a staircase cannot hold a
+  piece), SRS kicks in both directions, garbage pushed above the top is a top-out
   ([HARDENING.md](docs/HARDENING.md#найдено-позже)).
 - **Binary protocol:** 20,000 random round-trip steps, byte-for-byte equality of
   delta-built fields with the authoritative snapshot over a real WebSocket, fuzzing of

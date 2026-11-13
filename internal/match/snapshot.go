@@ -185,6 +185,7 @@ func Restore(data []byte, cfg Config, now time.Time) (*Match, error) {
 		shiftTime(&seat.LastInput, play)
 		shiftTime(&seat.IdleStop, play)
 		shiftTime(&seat.LockAt, play)
+		shiftTime(&seat.PieceAt, play)
 		if seat.Connected || seat.LeftAt.IsZero() {
 			seat.Connected, seat.LeftAt = false, now
 		} else {
