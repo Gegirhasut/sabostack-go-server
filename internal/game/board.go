@@ -31,8 +31,9 @@ const (
 )
 
 // MaxLockResets is how many times a move or rotation of a resting piece may restart its
-// lock delay. Reaching a new lowest row gives the piece its full allowance back, so the
-// total is bounded by the board height: a player cannot hold a piece on the floor forever.
+// lock delay. Only reaching a new lowest row gives the piece its allowance back: the
+// lowest row any of its cells has been in, so a turn in place is not one. The total is
+// bounded by the board height: a player cannot hold a piece on the floor forever.
 const MaxLockResets = 15
 
 // Valid reports whether a is a known action.
@@ -89,13 +90,14 @@ type Board struct {
 	Dead    bool   `json:"dead"`    // topped out
 
 	LockResets int `json:"lockResets"` // lock delay restarts used by the current piece
-	LowestY    int `json:"lowestY"`    // lowest row the current piece has reached
+	LowestY    int `json:"lowestY"`    // lowest row any cell of the current piece has been in
 }
 
 // Result describes what an action or gravity step did.
 type Result struct {
 	Moved   bool // the piece moved or rotated
 	Extend  bool // it did so while resting on something, within MaxLockResets: restart the lock delay
+	Lower   bool // it reached a new lowest row: its lock delay starts afresh once it rests
 	Locked  bool // the piece locked into the grid
 	Cleared int  // lines cleared by that lock
 	Garbage int  // garbage rows inserted on this board by that lock
@@ -152,8 +154,7 @@ func (b *Board) Gravity() Result {
 		return Result{}
 	}
 	if b.try(b.Piece.X, b.Piece.Y+1, b.Piece.Rot) {
-		b.fell()
-		return Result{Moved: true}
+		return Result{Moved: true, Lower: b.fell()}
 	}
 	return Result{}
 }
@@ -194,8 +195,7 @@ func (b *Board) rotate(turn int) Result {
 
 // moved records a successful move or rotation for the lock delay.
 func (b *Board) moved(grounded bool) Result {
-	r := Result{Moved: true}
-	b.fell()
+	r := Result{Moved: true, Lower: b.fell()}
 	if grounded && b.LockResets < MaxLockResets {
 		b.LockResets++
 		r.Extend = true
@@ -203,11 +203,14 @@ func (b *Board) moved(grounded bool) Result {
 	return r
 }
 
-// fell notes a new lowest row: the piece gets its lock delay restarts back.
-func (b *Board) fell() {
-	if b.Piece.Y > b.LowestY {
-		b.LowestY, b.LockResets = b.Piece.Y, 0
+// fell notes a new lowest row, by the piece's bottom cell (the top of its box moves when
+// it turns in place): the piece gets its lock delay restarts back.
+func (b *Board) fell() bool {
+	if bottom := b.Piece.bottom(); bottom > b.LowestY {
+		b.LowestY, b.LockResets = bottom, 0
+		return true
 	}
+	return false
 }
 
 // GarbageFor is the attack sent for clearing n lines at once.
@@ -342,6 +345,6 @@ func (b *Board) nextKind() Kind {
 func (b *Board) spawn() bool {
 	k := b.nextKind()
 	b.Piece = Piece{Kind: k, X: (Width - shapes[k].n) / 2}
-	b.LowestY, b.LockResets = b.Piece.Y, 0
+	b.LowestY, b.LockResets = b.Piece.bottom(), 0
 	return b.fits(b.Piece)
 }

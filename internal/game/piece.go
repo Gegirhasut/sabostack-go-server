@@ -71,6 +71,15 @@ func (p Piece) Cells() [4]cell {
 	return out
 }
 
+// bottom is the lowest board row the piece occupies.
+func (p Piece) bottom() int {
+	y := 0
+	for _, c := range p.Cells() {
+		y = max(y, c.Y)
+	}
+	return y
+}
+
 // SRS wall kicks: the offsets tried in order when a piece turns from one state to the
 // next (0 = spawn, 1 = clockwise of it, 2, 3). They are written as in the SRS tables, with
 // y pointing up; kicksFor flips y for this board, where it points down.

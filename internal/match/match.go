@@ -50,7 +50,9 @@ type Config struct {
 	// step that found it resting, so a player 100–150 ms away still has time to slide or
 	// turn it along the floor. A move or turn of the resting piece restarts the delay, at
 	// most game.MaxLockResets times per piece (more after it reaches a new lowest row).
-	// 0 = lock on contact.
+	// Nothing else restarts it: a turn that lifts the piece leaves the timer running, and
+	// a piece still in the air when it runs out drops and locks LockDelay later at the
+	// latest. 0 = lock on contact.
 	LockDelay      time.Duration
 	WinsNeeded     int // rounds needed to win the match
 	MaxRounds      int
@@ -490,15 +492,24 @@ func (m *Match) play(now time.Time) {
 	for steps := 0; m.Phase == Playing && steps < 20; steps++ {
 		at, lock := m.NextGravity, NoSeat
 		for i, s := range m.Seats {
-			if !s.LockAt.IsZero() && s.LockAt.Before(at) {
-				at, lock = s.LockAt, i
+			if s.LockAt.IsZero() {
+				continue
+			}
+			due := s.LockAt
+			if !s.Board.Grounded() {
+				// A turn lifted it: it locks as soon as it lands, and if a player keeps it
+				// in the air past one more delay, it is dropped.
+				due = due.Add(m.cfg.LockDelay)
+			}
+			if due.Before(at) {
+				at, lock = due, i
 			}
 		}
 		if now.Before(at) {
 			break
 		}
 		if lock != NoSeat {
-			m.handle(lock, m.Seats[lock].Board.Lock(), now)
+			m.handle(lock, m.Seats[lock].Board.Apply(game.HardDrop), now) // a resting piece drops 0 rows
 			continue
 		}
 		m.NextGravity = m.NextGravity.Add(m.cfg.Gravity)
@@ -635,16 +646,28 @@ func (m *Match) newBoards() {
 	}
 }
 
-// settle runs the lock delay of a seat after anything happened to its piece: the timer
-// starts when the piece comes to rest, restarts when a move or turn of the resting piece
-// is allowed to extend it (game.Result.Extend) or a new piece spawns resting, and stops
-// when the piece falls free again.
+// settle runs the lock delay of a seat after anything happened to its piece. The timer
+// starts when the piece first comes to rest and starts afresh only for a new piece or a
+// new lowest row (game.Result.Lower); a move or turn of the resting piece restarts it
+// within game.MaxLockResets (game.Result.Extend). Nothing else touches it. In particular
+// a turn that lifts the piece off the floor does not stop it: clearing the timer there
+// gave every landing on the same row a full new delay, and turning back and forth held
+// a piece on the floor for ever (and a player ahead on points could sit out the round,
+// since incoming garbage only rises when a piece locks).
 func (m *Match) settle(seat int, r game.Result, now time.Time) {
 	s := m.Seats[seat]
+	b := s.Board
 	switch {
-	case !s.Board.Grounded():
+	case b.Dead:
 		s.LockAt = time.Time{}
-	case s.LockAt.IsZero() || r.Extend || r.Locked:
+	case r.Locked || r.Lower:
+		s.LockAt = time.Time{}
+		if b.Grounded() {
+			s.LockAt = now.Add(m.cfg.LockDelay)
+		}
+	case r.Extend:
+		s.LockAt = now.Add(m.cfg.LockDelay)
+	case s.LockAt.IsZero() && b.Grounded():
 		s.LockAt = now.Add(m.cfg.LockDelay)
 	}
 }

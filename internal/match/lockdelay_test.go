@@ -1,6 +1,7 @@
 package match
 
 import (
+	"math/rand/v2"
 	"testing"
 	"time"
 
@@ -122,5 +123,92 @@ func TestLockDelaySurvivesRestore(t *testing.T) {
 	r.Advance(back)
 	if got := r.Seats[0].LockAt.Sub(back); got != left {
 		t.Fatalf("after the restore and the resync the lock timer has %s left, want the %s it had", got, left)
+	}
+}
+
+// Bug: a turn that lifted a resting piece cleared its lock timer, and landing again on
+// the same row started a full new delay, so turning back and forth held any piece on the
+// floor for ever: 400 turns gave 202 full delays. A player ahead on points could sit out
+// the round, since incoming garbage only rises when a piece locks. Now, whatever the
+// player does on the floor, every kind locks within (MaxLockResets+1) delays.
+func TestSpinningCannotHoldAPieceForever(t *testing.T) {
+	cfg := testConfig()
+	patterns := [][]game.Action{
+		{game.Rotate, game.RotateCCW},
+		{game.Rotate, game.RotateCCW, game.Rotate, game.Rotate, game.Left, game.RotateCCW, game.Right},
+	}
+	for i := 0; i < 7*len(patterns); i++ {
+		kind, pattern := []game.Kind{game.I, game.O, game.T, game.S, game.Z, game.J, game.L}[i%7], patterns[i/7]
+		m, _, _, start := newPlaying(t, cfg)
+		b := m.Seats[0].Board
+		b.Piece = game.Piece{Kind: kind, X: 3}
+		b.LowestY, b.LockResets = 0, 0
+		restOnFloor(t, m, 0)
+		rested := start.Add(cfg.Gravity)
+		limit := time.Duration(game.MaxLockResets+1) * cfg.LockDelay
+		var seq uint64
+		var lockedAt time.Time
+		for now := start; now.Before(rested.Add(limit + 2*time.Second)); now = now.Add(cfg.TickInterval) {
+			if now.After(rested) {
+				seq++
+				m.Input(0, seq, pattern[int(seq)%len(pattern)], now)
+			}
+			m.Advance(now)
+			if lockedCells(b) > 0 {
+				lockedAt = now
+				break
+			}
+		}
+		if lockedAt.IsZero() || lockedAt.Sub(rested) > limit {
+			held := "never locked"
+			if !lockedAt.IsZero() {
+				held = "locked after " + lockedAt.Sub(rested).String()
+			}
+			t.Fatalf("%c turned on the floor every tick (%v): %s, want within %s", kind, pattern, held, limit)
+		}
+		t.Logf("%c %v: locked %s after coming to rest", kind, pattern, lockedAt.Sub(rested))
+	}
+}
+
+// The invariant behind the fixes above, under random play: once a piece has stopped
+// reaching new lowest rows, it locks within MaxLockResets+1 delays, plus one more if a
+// turn left it in the air when its time ran out. Random inputs at 20 per second, mostly
+// turns (the moves that lift a piece) and no hard drops, several seeds, until the round
+// ends: pieces only lock by the delay here.
+func TestRandomPlayLocksEveryPieceInTime(t *testing.T) {
+	cfg := testConfig()
+	cfg.IdleTimeout, cfg.RoundTime = time.Hour, 5*time.Minute
+	actions := []game.Action{game.Rotate, game.RotateCCW, game.Rotate, game.RotateCCW, game.Left, game.Right, game.SoftDrop}
+	limit := time.Duration(game.MaxLockResets+2)*cfg.LockDelay + cfg.TickInterval
+	pieces := 0
+	for seed := uint64(1); seed <= 8; seed++ {
+		rng := rand.New(rand.NewPCG(seed, seed))
+		m, _, _, start := newPlaying(t, cfg)
+		var seq uint64
+		lowest, lowerAt := m.Seats[0].Board.LowestY, start
+		for now := start; m.Phase == Playing && now.Before(start.Add(4*time.Minute)); now = now.Add(cfg.TickInterval) {
+			seq++
+			m.Input(0, seq, actions[rng.IntN(len(actions))], now)
+			m.Advance(now)
+			if m.Phase != Playing {
+				break
+			}
+			b := m.Seats[0].Board
+			switch {
+			case b.LowestY < lowest: // a new piece
+				pieces++
+				lowest, lowerAt = b.LowestY, now
+			case b.LowestY > lowest:
+				lowest, lowerAt = b.LowestY, now
+			}
+			if held := now.Sub(lowerAt); held > limit {
+				t.Fatalf("seed %d: a %c piece has been at its lowest row %d for %s, want it locked within %s",
+					seed, b.Piece.Kind, b.LowestY, held, limit)
+			}
+		}
+	}
+	t.Logf("%d pieces", pieces)
+	if pieces < 50 {
+		t.Fatalf("only %d pieces played: the test did not exercise locking", pieces)
 	}
 }

@@ -85,7 +85,7 @@ func TestGravityLeavesRestingPiece(t *testing.T) {
 func TestLockResetsAreBounded(t *testing.T) {
 	b := NewBoard(1, 1)
 	b.Piece = Piece{Kind: O, X: 4, Y: 0}
-	b.LowestY, b.LockResets = 0, 0
+	b.LowestY, b.LockResets = 1, 0
 	b.Grid[2][4], b.Grid[2][5] = 'X', 'X' // a ledge under the O
 	extends := 0
 	for i := 0; i < 3*MaxLockResets; i++ {
@@ -130,5 +130,27 @@ func TestGarbageAboveTheTopIsATopOut(t *testing.T) {
 		if r.Garbage != 1 || r.Died != tc.dies || b.Dead != tc.dies {
 			t.Fatalf("cell in row %d, one garbage row: %+v dead=%v, want died=%v", tc.row, r, b.Dead, tc.dies)
 		}
+	}
+}
+
+// Bug: the lowest row was the top of the piece's box, which moves when the piece turns in
+// place, so two turns on the same floor gave a piece its 15 lock delay restarts back.
+// It is the piece's bottom cell now.
+func TestTurningInPlaceIsNotANewLowestRow(t *testing.T) {
+	b := NewBoard(1, 1)
+	b.Piece = Piece{Kind: T, Rot: 2, X: 3, Y: 17} // flat side up, bottom cell on the floor
+	if !b.Grounded() {
+		t.Fatal("test setup: T not resting on the floor")
+	}
+	b.LowestY, b.LockResets = Height-1, MaxLockResets
+	for i := 0; i < 2; i++ {
+		if r := b.Apply(Rotate); !r.Moved || r.Lower || r.Extend {
+			t.Fatalf("turn %d on the floor: %+v, want a plain move", i, r)
+		}
+	}
+	for b.Gravity().Moved {
+	}
+	if b.LockResets != MaxLockResets {
+		t.Fatalf("turning in place and landing again gave the restarts back: %d used, want %d", b.LockResets, MaxLockResets)
 	}
 }
