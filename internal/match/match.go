@@ -334,8 +334,9 @@ func (m *Match) Detach(seat int, sink Sink, now time.Time) {
 // Input applies a player action. seq makes inputs idempotent: anything at or below the
 // last consumed seq is dropped. A seq is consumed even when the action is ignored because
 // of the phase, so a retransmit can never be applied later in a different round. The
-// exception is a match resyncing after a restore: the input is not acked there, so the
-// client resends it and it applies once the match runs again (the same round).
+// same holds while a restored match resyncs: the input is acked and dropped, as in
+// Countdown. Were it left unacked, the client would resend everything the player pressed
+// at the frozen board and it would all apply at once on the first tick after resumed.
 //
 // An input is proof the player is there: one from a seat marked away by silence brings
 // it back at once, without the steady-contact wait that pongs need (see watchSilence).
@@ -351,12 +352,9 @@ func (m *Match) Input(seat int, seq uint64, a game.Action, now time.Time) InputR
 		m.back(seat, now)
 		m.touch()
 	}
-	if m.resyncing() {
-		return InputNotPlaying
-	}
 	s.LastSeq = seq
 	m.touch() // the ack changed even if nothing else did
-	if m.Phase != Playing {
+	if m.Phase != Playing || m.resyncing() {
 		return InputNotPlaying
 	}
 	s.LastInput = now

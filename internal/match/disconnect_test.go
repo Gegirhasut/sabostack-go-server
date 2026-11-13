@@ -447,8 +447,9 @@ func TestRestoredMatchWaitsForBothPlayers(t *testing.T) {
 			t.Fatalf("%s into the wait: paused=%v remaining=%dms piece y %d->%d", at.Sub(restoredAt), st.Paused, st.RemainingMs, y, r.Seats[0].Board.Piece.Y)
 		}
 	}
-	if got := r.Input(0, 2, game.Left, back); got != InputNotPlaying || r.Seats[0].LastSeq != 1 {
-		t.Fatalf("input while resyncing: %s, lastSeq %d (want it not acked, so the client resends it)", got, r.Seats[0].LastSeq)
+	x := r.Seats[0].Board.Piece.X
+	if got := r.Input(0, 2, game.Left, back); got != InputNotPlaying || r.Seats[0].LastSeq != 2 || r.Seats[0].Board.Piece.X != x {
+		t.Fatalf("input while resyncing: %s, lastSeq %d, piece x %d->%d (want it acked and dropped)", got, r.Seats[0].LastSeq, x, r.Seats[0].Board.Piece.X)
 	}
 	if _, err := r.Attach(tokens[1], &fakeSink{}, 0, back); err != nil {
 		t.Fatal(err)
@@ -463,8 +464,11 @@ func TestRestoredMatchWaitsForBothPlayers(t *testing.T) {
 	if got := back.Sub(r.Seats[1].LastInput); got != idle {
 		t.Fatalf("idle %s after the wait, want the %s it had", got, idle)
 	}
-	if got := r.Input(0, 2, game.Left, back); got != InputApplied {
-		t.Fatalf("the input resent after the resume: %s", got)
+	if got := r.Input(0, 2, game.Left, back); got != InputDuplicate {
+		t.Fatalf("the blind input resent after the resume: %s, want it dropped as a duplicate", got)
+	}
+	if got := r.Input(0, 3, game.Left, back); got != InputApplied {
+		t.Fatalf("a new input after the resume: %s", got)
 	}
 }
 
