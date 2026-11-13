@@ -27,9 +27,9 @@ One laptop, WSL2 with 8 vCPUs, server and bots on the same machine (methodology 
   errors. On a rolling deploy (SIGTERM): 206 of 206 within 3.9 s, with no lost progress
   ([CLUSTER.md](docs/CLUSTER.md)).
 - **~76 KB of memory and ~0.05 % of a core per player.** CPU is the limit, not memory.
-- **119 tests and 2 fuzz targets, all passing under `-race`.** 13 tests reproduce bugs
+- **123 tests and 2 fuzz targets, all passing under `-race`.** 13 tests reproduce bugs
   found while hardening: each fails on the code before the fix and passes after it
-  ([HARDENING.md](docs/HARDENING.md)). 24 more cover defects found later
+  ([HARDENING.md](docs/HARDENING.md)). 31 more cover defects found later
   ([HARDENING.md](docs/HARDENING.md#найдено-позже)). The store and cluster tests run
   against both miniredis and a real Redis. The load bot checks protocol invariants on
   every frame: 0 violations in the final runs.
@@ -56,7 +56,7 @@ The detailed documents are in Russian.
 | Binary protocol | `internal/wire`, `internal/server/conn.go` | Subprotocol `sabostack.bin.v1`. The delta is computed in the writer goroutine against what was *actually* sent to the client, so it stays consistent with outbox conflation and reconnects. Fuzzing found and closed a decoder crash. |
 | Timers | `Match.Advance`, `internal/clock` | 20 Hz tick; every timer is a deadline on a swappable clock, so tests are deterministic. |
 | Reconnection | `Match.Attach`, `Match.Advance` | A session token (only its SHA-256 is stored); the first message is a snapshot with the missed events. The match never pauses: a dropped player's board keeps falling while the opponent plays on, and they have 20 s to resume or forfeit. |
-| Connection loss | `internal/server`, `Match.SetSilent` | A half-open connection is noticed by silence: 8 s without a message or a pong marks the seat away and starts the grace, while the socket stays open in case the client was only slow. What a client does on its side: [client contract](docs/ARCHITECTURE.md#контракт-клиента--потеря-соединения). |
+| Connection loss | `Match.Advance`, `internal/server/conn.go` | A half-open connection is noticed by silence, by the match on its own tick: 8 s without a message or a pong marks the seat away and starts the grace, while the socket stays open in case the client was only slow. It comes back after 4 s of steady contact (hysteresis, so a stalling connection does not flap). What a client does on its side: [client contract](docs/ARCHITECTURE.md#контракт-клиента--потеря-соединения). |
 | Crash recovery | `snapshot.go`, `manager.go` | Snapshots are written by several persisters with coalescing and pipelined batches, behind a circuit breaker for Redis outages. After a rewind to a snapshot, event numbers are never reused. |
 | Cluster | `internal/cluster`, `internal/store/cluster.go` | A one-key lease per node, batched takeover of a dead node's matches under a lock, Lua fencing of the owner, self-fencing on Redis loss, a shared matchmaking queue with pub/sub and redirects. |
 | Fault isolation | `Actor.run` | A panic in one match stops only that match. |
@@ -116,15 +116,18 @@ stateDiagram-v2
     MatchEnd --> [*]
 ```
 
-The match never pauses: the player with a good connection never waits for one with a bad
-connection. While a player is disconnected, their board keeps falling (pieces lock,
+A disconnect never pauses the match: the player with a good connection never waits for
+one with a bad connection. While a player is disconnected, their board keeps falling (pieces lock,
 incoming garbage rises, a top-out loses the round), the round timer keeps running and the
 opponent keeps playing. The disconnected player resumes from whatever their board is by
 then, or forfeits if they are not back within the reconnect grace (20 s). If both are away
 and both graces run out on the same tick, nobody wins (`both_disconnected`); otherwise each
 player's grace is their own. The idle timeout (30 s without input) counts only connected
-time, so it never fires for a player the grace is already counting. Details in
-[ARCHITECTURE.md](docs/ARCHITECTURE.md#отключения-матч-не-ждёт).
+time, so it never fires for a player the grace is already counting. The one stand-still
+is the server's own: after a restart or a failover both players have to find the new node,
+so a restored match stands still (`paused`) until both are back, for at most 10 s
+(`-resync-wait`); otherwise whoever's client reconnected first would win the round.
+Details in [ARCHITECTURE.md](docs/ARCHITECTURE.md#отключения-матч-не-ждёт).
 
 ### Game rules (simplified)
 
@@ -160,13 +163,14 @@ disconnected with `rate_limited`.
 | `queued` | | After `join`. |
 | `matched` | `matchId`, `seat`, `token`, `opponent`, `url` | Opponent found. If `url` is set, the match runs on another node: connect there and `resume`. |
 | `snapshot` | `matchId`, `seat`, `state`, `events[]`, `eventsComplete` | Always the first message after attaching to a match. `eventsComplete=false` means the client's history is invalid (the log is shorter, or the match rewound to a snapshot after a node crash): trust `state`, resend unacknowledged inputs. |
-| `state` | `tick`, `phase`, `round`, `paused`, `remainingMs`, `ack`, `eventSeq`, `players[]` | At most once per tick, and only on change. An unsent `state` is replaced by a newer one. `paused` is always `false` (matches no longer pause) and stays only for older clients; `players[i].connected` is `false` while that player is away. |
-| `event` | `event: {seq, atMs, kind, ...}` | `phase`, `cleared`, `garbage`, `round_over`, `match_over`, `player_left`, `player_back`. Never lost or reordered. `paused` and `resumed` are no longer sent; a match restored from an older build's snapshot may still replay them, so ignore unknown kinds. |
+| `state` | `tick`, `phase`, `round`, `paused`, `remainingMs`, `ack`, `eventSeq`, `players[]` | At most once per tick, and only on change. An unsent `state` is replaced by a newer one. `paused` is `true` only while a restored match waits for its players after a restart or failover (`remainingMs` stands still, inputs are not applied); a disconnect never pauses a match. `players[i].connected` is `false` while that player is away. |
+| `event` | `event: {seq, atMs, kind, ...}` | `phase`, `cleared`, `garbage`, `round_over`, `match_over`, `player_left`, `player_back`, `resumed` (a restored match runs again). Never lost or reordered. `paused` is no longer sent; ignore unknown kinds. |
 | `error` | `code`, `message`, `url` | `wrong_server` (reconnect to `url`), `match_moving` (the match's node died and it is being taken over — retry), `match_not_found`, `bad_token`, `rate_limited`, `unavailable`, `bad_name`, `bad_request`, `bad_json`, `timeout`. |
 | `pong` | `t` | |
 
 `match_over` reasons: `rounds`, `draw`, `opponent_disconnected`, `both_disconnected`,
-`opponent_idle`, `both_idle`, `opponent_never_joined`, `internal_error`.
+`opponent_idle`, `both_idle`, `disconnected_and_idle`, `opponent_never_joined`,
+`internal_error`.
 
 ```text
 → {"type":"join","name":"alice"}
@@ -224,7 +228,7 @@ Main production flags:
 | `-input-rate`, `-input-burst` | 40, 20 | Token bucket for client messages. |
 | `-node-id`, `-public-url`, `-lease`, `-shared-queue` | off, —, 10 s, on | Cluster ([CLUSTER.md](docs/CLUSTER.md)). |
 | `-drain-timeout` | 0 | On SIGTERM, stop matchmaking and let running matches finish. |
-| `-reconnect-grace`, `-idle-timeout` | 20 s, 30 s | Disconnect rules ([ARCHITECTURE.md](docs/ARCHITECTURE.md#отключения-матч-не-ждёт)). |
+| `-reconnect-grace`, `-idle-timeout`, `-resync-wait` | 20 s, 30 s, 10 s | Disconnect rules ([ARCHITECTURE.md](docs/ARCHITECTURE.md#отключения-матч-не-ждёт)). The server refuses to start with timings that break them (a drop noticed only after the idle timeout, pings too rare for the silence timeout, a resync wait not under the grace). |
 | `-ping-interval`, `-silence-timeout`, `-pong-wait` | 2 s, 8 s, 30 s | Heartbeat: a client heard nothing from for 8 s is marked away, its socket is closed after 30 s. Why these values: [HARDENING.md](docs/HARDENING.md#heartbeat-тишина-8-с-обрыв-30-с). |
 
 ### Production checklist
@@ -264,19 +268,21 @@ go test -run '^$' -fuzz FuzzDecodeState ./internal/wire
 - 30 s of fuzzing for each decoder;
 - a Docker image build and a run with a `/healthz` check.
 
-119 tests and 2 fuzz targets. The concurrency and cluster tests were run many times
+123 tests and 2 fuzz targets. The concurrency and cluster tests were run many times
 (`-count=20…300`) to rule out flakiness.
 
 - **Bug reproductions (13):** every bug found while hardening is covered by a test written
   against the old API: it fails with a meaningful message on the code before the fix and
   passes after it ([table](docs/HARDENING.md#баги-и-их-воспроизведение)).
-- **Defects found later (24):** IP spoofing via `X-Forwarded-For`, extra time before an
+- **Defects found later (31):** IP spoofing via `X-Forwarded-For`, extra time before an
   idle forfeit after reconnecting, self-fencing before the lease expires, retrying an
   unsaved snapshot, a leaving node is no redirect target, `pong` while queued, no double
   assignment in matchmaking, a `WaitGroup` race at shutdown, a zombie match on a fenced
   node, leaked tickets of players who left, a ghost ticket in the queue, a match is
   announced only after it is stored, snapshots of an unknown version are not deleted
-  during a rollout, player tokens never reach Redis
+  during a rollout, player tokens never reach Redis, a restored match waits for both
+  players, a stalling connection does not flap away/back, timing flags are checked at
+  startup, the snapshot version is bumped with a migration
   ([HARDENING.md](docs/HARDENING.md#найдено-позже)).
 - **Binary protocol:** 20,000 random round-trip steps, byte-for-byte equality of
   delta-built fields with the authoritative snapshot over a real WebSocket, fuzzing of
@@ -291,8 +297,10 @@ go test -run '^$' -fuzz FuzzDecodeState ./internal/wire
 - **Disconnects (fake clock):** the opponent plays on and the round timer runs while a
   player is away, the away board falls and tops out, a resume sees the board as it is now,
   the grace running out (also between rounds), both players away, idle time vs the grace,
-  restore and a takeover over Redis with a player away, old snapshots with pause fields,
-  a silent connection marked away and back.
+  restore and a takeover over Redis with a player away, a restored match waiting for both
+  players (and only up to `-resync-wait`), version-1 snapshots migrated, a silent
+  connection marked away and back only after steady contact, grace and idle on one tick,
+  timing flags checked at startup.
 - **Transport and operations:** flooding, outbox conflation, Origin, per-IP limit,
   draining, redirect to the owner, admin port, malformed frames, silence detection (on a
   fake clock, and by pongs over real sockets).
@@ -311,6 +319,11 @@ JSON protocol, medians over runs (raw data in `docs/loadtest/hardening/`):
 | 1,000 | 2,000 | 187 MB | 150 % of a core | 25.6 / 48.4 / 50.6 ms | 0 / 0 |
 | 2,000 | 4,000 | 339 MB | 255 % of a core | 28.2 / 61.7 / 132 ms | 0 / 0 |
 | 3,000 | 6,000 | 479 MB | 330 % of a core | 32.1 / 96.0 / 198 ms | 0 / 0 |
+
+These runs used the old heartbeat (a ping every 20 s). Pinging every 2 s, as the server
+now does, was measured against it on the same bench: within noise at 1,000 pairs, about
++4 % server CPU at 2,000 pairs (4,000 connections), memory unchanged, no errors
+([HARDENING.md](docs/HARDENING.md#стоимость-пингов-раз-в-2-с)).
 
 Binary protocol on the same steps (medians, [WIRE.md](docs/WIRE.md#под-нагрузкой)):
 

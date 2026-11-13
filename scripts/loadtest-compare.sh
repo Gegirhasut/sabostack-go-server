@@ -11,7 +11,7 @@
 set -u
 BEFORE=$1; AFTER=$2; BOT=$3; DUR=$4; shift 4
 REPO=${REPO:-$(cd "$(dirname "$0")/.." && pwd)}
-OUT=$REPO/docs/loadtest/hardening; mkdir -p "$OUT"
+OUT=${OUT:-$REPO/docs/loadtest/hardening}; mkdir -p "$OUT"
 D=/tmp/sabocompare; mkdir -p $D
 cp "$BEFORE" $D/server-before && cp "$AFTER" $D/server-after && cp "$BOT" $D/bot || exit 1
 chmod +x $D/server-before $D/server-after $D/bot

@@ -1,0 +1,85 @@
+uname: Linux 6.6.87.2-microsoft-standard-WSL2, nproc: 8, duration: 60s
+=== before-1000 (before, 1000 pairs) 2026-11-13T13:19:04+02:00
+bot exit: 0
+matches finished:   3035
+errors / dropped:   0 / 0
+input->ack latency: p50=27.0ms p95=49.8ms p99=70.2ms max=179.3ms (n=292858)
+server CPU:         165.0% of one core
+server RSS:         avg 195.4 MB, max 198.7 MB (start 169.5, end 197.0)
+server tick:        mean 9.3µs, max 54.69ms
+bot_max_rss_kb=121588 bot_cpu_user_s=66.76 bot_cpu_sys_s=46.23
+bot stderr lines (errors): 0
+server_peak_VmHWM:	  194048 kB
+server exit code: 0, shutdown took .037566324s
+server_error_log_lines=0
+host load: 30.86 27.50 26.33
+=== after-1000 (after, 1000 pairs) 2026-11-13T13:20:23+02:00
+bot exit: 0
+matches finished:   3015
+errors / dropped:   0 / 0
+input->ack latency: p50=26.8ms p95=49.2ms p99=57.4ms max=190.5ms (n=293695)
+server CPU:         161.1% of one core
+server RSS:         avg 197.1 MB, max 202.0 MB (start 176.7, end 197.4)
+server tick:        mean 9.1µs, max 70.83ms
+bot_max_rss_kb=124196 bot_cpu_user_s=63.81 bot_cpu_sys_s=49.25
+bot stderr lines (errors): 0
+server_peak_VmHWM:	  197368 kB
+server exit code: 0, shutdown took .036608164s
+server_error_log_lines=0
+host load: 32.29 28.65 26.82
+=== before-2000 (before, 2000 pairs) 2026-11-13T13:21:42+02:00
+bot exit: 0
+matches finished:   5915
+errors / dropped:   0 / 0
+input->ack latency: p50=29.9ms p95=78.2ms p99=163.3ms max=1123.6ms (n=589955)
+server CPU:         245.5% of one core
+server RSS:         avg 353.0 MB, max 355.8 MB (start 330.7, end 355.8)
+server tick:        mean 16.2µs, max 96.29ms
+bot_max_rss_kb=226432 bot_cpu_user_s=110.14 bot_cpu_sys_s=62.48
+bot stderr lines (errors): 0
+server_peak_VmHWM:	  347436 kB
+server exit code: 0, shutdown took .095340708s
+server_error_log_lines=0
+host load: 34.63 30.23 27.53
+=== after-2000 (after, 2000 pairs) 2026-11-13T13:23:04+02:00
+bot exit: 0
+matches finished:   5893
+errors / dropped:   0 / 0
+input->ack latency: p50=30.7ms p95=87.1ms p99=214.3ms max=918.9ms (n=587863)
+server CPU:         256.8% of one core
+server RSS:         avg 354.8 MB, max 358.6 MB (start 331.4, end 358.6)
+server tick:        mean 16.4µs, max 107.28ms
+bot_max_rss_kb=225792 bot_cpu_user_s=110.29 bot_cpu_sys_s=65.75
+bot stderr lines (errors): 0
+server_peak_VmHWM:	  350208 kB
+server exit code: 0, shutdown took .061397000s
+server_error_log_lines=0
+host load: 35.19 31.44 28.18
+=== before-2000-r2 (before, 2000 pairs) 2026-11-13T13:24:26+02:00
+bot exit: 0
+matches finished:   5928
+errors / dropped:   0 / 0
+input->ack latency: p50=28.5ms p95=60.7ms p99=116.2ms max=619.6ms (n=592934)
+server CPU:         239.1% of one core
+server RSS:         avg 357.7 MB, max 361.2 MB (start 335.0, end 360.1)
+server tick:        mean 12.9µs, max 107.57ms
+bot_max_rss_kb=228960 bot_cpu_user_s=107.98 bot_cpu_sys_s=62.15
+bot stderr lines (errors): 0
+server_peak_VmHWM:	  352768 kB
+server exit code: 0, shutdown took .066999904s
+server_error_log_lines=0
+host load: 34.79 32.22 28.73
+=== after-2000-r2 (after, 2000 pairs) 2026-11-13T13:25:47+02:00
+bot exit: 0
+matches finished:   5896
+errors / dropped:   0 / 0
+input->ack latency: p50=29.4ms p95=67.8ms p99=133.3ms max=361.8ms (n=591743)
+server CPU:         249.7% of one core
+server RSS:         avg 356.3 MB, max 360.3 MB (start 325.1, end 360.3)
+server tick:        mean 16.7µs, max 164.94ms
+bot_max_rss_kb=225664 bot_cpu_user_s=110.36 bot_cpu_sys_s=65.62
+bot stderr lines (errors): 0
+server_peak_VmHWM:	  351872 kB
+server exit code: 0, shutdown took .063973569s
+server_error_log_lines=0
+host load: 34.70 32.73 29.21
