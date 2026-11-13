@@ -45,7 +45,13 @@ type Config struct {
 	// still (paused) until both players are back or this passes, so nobody loses round
 	// time to the server's failure while the clients find the new node. Each player's
 	// reconnect grace still runs from the restore. 0 = no wait.
-	ResyncWait     time.Duration
+	ResyncWait time.Duration
+	// LockDelay: a piece that comes to rest locks this long later, not on the gravity
+	// step that found it resting, so a player 100–150 ms away still has time to slide or
+	// turn it along the floor. A move or turn of the resting piece restarts the delay, at
+	// most game.MaxLockResets times per piece (more after it reaches a new lowest row).
+	// 0 = lock on contact.
+	LockDelay      time.Duration
 	WinsNeeded     int // rounds needed to win the match
 	MaxRounds      int
 	EventLogSize   int // events kept for reconnect catch-up
@@ -65,6 +71,7 @@ func DefaultConfig() Config {
 		IdleTimeout:    30 * time.Second,
 		SilenceTimeout: 8 * time.Second,
 		ResyncWait:     10 * time.Second,
+		LockDelay:      500 * time.Millisecond,
 		WinsNeeded:     2,
 		MaxRounds:      3,
 		EventLogSize:   256,
@@ -120,6 +127,7 @@ type Seat struct {
 	LastSeq   uint64      `json:"lastSeq"`   // highest input seq consumed (idempotency)
 	Wins      int         `json:"wins"`
 	Board     *game.Board `json:"board"`
+	LockAt    time.Time   `json:"lockAt"` // when the resting piece locks (Config.LockDelay); zero while it falls
 
 	sink       Sink
 	rewound    bool      // restored from a non-final snapshot; cleared by the next Attach
@@ -271,6 +279,7 @@ func (m *Match) resync(now time.Time) bool {
 	shiftTime(&m.NextGravity, stood)
 	m.ResyncFrom, m.ResyncUntil = time.Time{}, time.Time{}
 	for _, s := range m.Seats {
+		shiftTime(&s.LockAt, stood)
 		if s.Connected {
 			m.runIdle(s, now)
 		}
@@ -473,11 +482,25 @@ func later(a, b time.Time) time.Time {
 	return b
 }
 
-// play runs gravity on both boards, whether their players are connected or not, and
-// the round timer.
+// play runs gravity and the lock delays on both boards, whether their players are
+// connected or not, and the round timer.
 func (m *Match) play(now time.Time) {
-	// Gravity catches up if a tick ran late, but never loops unboundedly.
-	for steps := 0; !now.Before(m.NextGravity) && m.Phase == Playing && steps < 10; steps++ {
+	// Gravity steps and locks run in the order they fall due, catching up if a tick ran
+	// late, but never looping unboundedly.
+	for steps := 0; m.Phase == Playing && steps < 20; steps++ {
+		at, lock := m.NextGravity, NoSeat
+		for i, s := range m.Seats {
+			if !s.LockAt.IsZero() && s.LockAt.Before(at) {
+				at, lock = s.LockAt, i
+			}
+		}
+		if now.Before(at) {
+			break
+		}
+		if lock != NoSeat {
+			m.handle(lock, m.Seats[lock].Board.Lock(), now)
+			continue
+		}
 		m.NextGravity = m.NextGravity.Add(m.cfg.Gravity)
 		for i, s := range m.Seats {
 			m.handle(i, s.Board.Gravity(), now)
@@ -485,6 +508,9 @@ func (m *Match) play(now time.Time) {
 				return
 			}
 		}
+	}
+	if m.Phase != Playing {
+		return
 	}
 	if !now.Before(m.PhaseEnds) {
 		a, b := m.Seats[0].Board, m.Seats[1].Board
@@ -504,6 +530,7 @@ func (m *Match) handle(seat int, r game.Result, now time.Time) {
 	if r.Moved || r.Locked {
 		m.touch()
 	}
+	m.settle(seat, r, now)
 	me, opp := m.Seats[seat].Board, m.Seats[1-seat].Board
 	if r.Cleared > 0 {
 		attack := game.GarbageFor(r.Cleared)
@@ -604,6 +631,21 @@ func (m *Match) newBoards() {
 	pieceSeed := m.Seed + uint64(m.Round)*0x9e3779b97f4a7c15
 	for i, s := range m.Seats {
 		s.Board = game.NewBoard(pieceSeed, pieceSeed^uint64(i+1)*0xbf58476d1ce4e5b9)
+		s.LockAt = time.Time{}
+	}
+}
+
+// settle runs the lock delay of a seat after anything happened to its piece: the timer
+// starts when the piece comes to rest, restarts when a move or turn of the resting piece
+// is allowed to extend it (game.Result.Extend) or a new piece spawns resting, and stops
+// when the piece falls free again.
+func (m *Match) settle(seat int, r game.Result, now time.Time) {
+	s := m.Seats[seat]
+	switch {
+	case !s.Board.Grounded():
+		s.LockAt = time.Time{}
+	case s.LockAt.IsZero() || r.Extend || r.Locked:
+		s.LockAt = now.Add(m.cfg.LockDelay)
 	}
 }
 

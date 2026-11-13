@@ -62,7 +62,7 @@ func (q *inputQueue) take(spare []inputCmd) []inputCmd {
 	return b
 }
 
-var actions = [...]game.Action{game.Left, game.Right, game.Rotate, game.SoftDrop, game.HardDrop}
+var actions = [...]game.Action{game.Left, game.Right, game.Rotate, game.SoftDrop, game.HardDrop, game.RotateCCW}
 
 const badAction = uint8(len(actions))
 

@@ -35,7 +35,7 @@
 //
 // # Client frames
 //
-//	input: byte 0x10, uvarint seq, byte action (0 left, 1 right, 2 rotate, 3 soft_drop, 4 hard_drop)
+//	input: byte 0x10, uvarint seq, byte action (0 left, 1 right, 2 rotate, 3 soft_drop, 4 hard_drop, 5 rotate_ccw)
 //	ping:  byte 0x11, svarint t
 //	pong:  byte 0x02, svarint t   (server to client)
 package wire
@@ -76,7 +76,7 @@ var phases = [...]string{"waiting", "countdown", "playing", "round_end", "match_
 // unknownPhase marks a phase name this version does not know (decoded as "").
 const unknownPhase = 7
 
-var actions = [...]game.Action{game.Left, game.Right, game.Rotate, game.SoftDrop, game.HardDrop}
+var actions = [...]game.Action{game.Left, game.Right, game.Rotate, game.SoftDrop, game.HardDrop, game.RotateCCW}
 
 var kinds = [...]game.Kind{game.I, game.O, game.T, game.S, game.Z, game.J, game.L}
 

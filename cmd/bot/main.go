@@ -50,7 +50,7 @@ type config struct {
 	Label        string `json:"label"`
 }
 
-var actions = []game.Action{game.Left, game.Right, game.Rotate, game.SoftDrop, game.HardDrop}
+var actions = []game.Action{game.Left, game.Right, game.Rotate, game.RotateCCW, game.SoftDrop, game.HardDrop}
 
 // stats is shared by all bots; counters only count after measuring starts.
 type stats struct {

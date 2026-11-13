@@ -16,7 +16,11 @@ import (
 // idleStop instead of at leftAt. The same version-1 snapshot meant a paused match to one
 // build and a running one to the next, so a mixed cluster would have run one match two
 // ways; with the bump a version-1 node leaves version-2 matches alone.
-const snapshotVersion = 2
+//
+// Version 3: a resting piece locks after the lock delay (seat lockAt, board lockResets
+// and lowestY), not on the gravity step that found it resting. A version-2 build would
+// ignore those fields and lock at once: one match, two sets of rules.
+const snapshotVersion = 3
 
 // snapshotMigrations[v] turns the "match" object of a version-v snapshot into version
 // v+1. A snapshot older than the oldest registered migration, or newer than this build,
@@ -24,7 +28,13 @@ const snapshotVersion = 2
 // a node of the right version may still need it.
 var snapshotMigrations = map[int]func(json.RawMessage) (json.RawMessage, error){
 	1: migrateV1,
+	2: migrateV2,
 }
+
+// migrateV2 turns a version-2 match into version 3. Nothing to rewrite: without lockAt a
+// resting piece gets its lock delay on the next gravity step, and the reset counters
+// start at zero.
+func migrateV2(raw json.RawMessage) (json.RawMessage, error) { return raw, nil }
 
 // migrateV1 turns a version-1 match into version 2. A version-1 build that paused
 // matches kept their clocks still from "pausedAt": that is exactly what resyncFrom means
@@ -174,6 +184,7 @@ func Restore(data []byte, cfg Config, now time.Time) (*Match, error) {
 	for _, seat := range m.Seats {
 		shiftTime(&seat.LastInput, play)
 		shiftTime(&seat.IdleStop, play)
+		shiftTime(&seat.LockAt, play)
 		if seat.Connected || seat.LeftAt.IsZero() {
 			seat.Connected, seat.LeftAt = false, now
 		} else {

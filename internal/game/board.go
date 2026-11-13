@@ -1,6 +1,8 @@
 // Package game is the deterministic, single-player falling-block simulation used by each
 // seat of a match. It has no notion of time or networking: the match loop calls Apply for
-// player actions and Gravity on the server-authoritative gravity timer.
+// player actions, Gravity on the server-authoritative gravity timer, and Lock when a
+// resting piece's lock delay runs out. The delay itself is the match's clock; the rule of
+// what restarts it (Result.Extend, at most MaxLockResets times per piece) lives here.
 package game
 
 import (
@@ -20,17 +22,23 @@ const (
 type Action string
 
 const (
-	Left     Action = "left"
-	Right    Action = "right"
-	Rotate   Action = "rotate"
-	SoftDrop Action = "soft_drop"
-	HardDrop Action = "hard_drop"
+	Left      Action = "left"
+	Right     Action = "right"
+	Rotate    Action = "rotate" // clockwise
+	SoftDrop  Action = "soft_drop"
+	HardDrop  Action = "hard_drop"
+	RotateCCW Action = "rotate_ccw"
 )
+
+// MaxLockResets is how many times a move or rotation of a resting piece may restart its
+// lock delay. Reaching a new lowest row gives the piece its full allowance back, so the
+// total is bounded by the board height: a player cannot hold a piece on the floor forever.
+const MaxLockResets = 15
 
 // Valid reports whether a is a known action.
 func (a Action) Valid() bool {
 	switch a {
-	case Left, Right, Rotate, SoftDrop, HardDrop:
+	case Left, Right, Rotate, RotateCCW, SoftDrop, HardDrop:
 		return true
 	}
 	return false
@@ -79,11 +87,15 @@ type Board struct {
 	Lines   int    `json:"lines"`
 	Pending int    `json:"pending"` // incoming garbage rows, applied on the next lock without a clear
 	Dead    bool   `json:"dead"`    // topped out
+
+	LockResets int `json:"lockResets"` // lock delay restarts used by the current piece
+	LowestY    int `json:"lowestY"`    // lowest row the current piece has reached
 }
 
 // Result describes what an action or gravity step did.
 type Result struct {
 	Moved   bool // the piece moved or rotated
+	Extend  bool // it did so while resting on something, within MaxLockResets: restart the lock delay
 	Locked  bool // the piece locked into the grid
 	Cleared int  // lines cleared by that lock
 	Garbage int  // garbage rows inserted on this board by that lock
@@ -109,37 +121,93 @@ func (b *Board) Apply(a Action) Result {
 		return Result{}
 	}
 	switch a {
-	case Left:
-		return Result{Moved: b.try(b.Piece.X-1, b.Piece.Y, b.Piece.Rot)}
-	case Right:
-		return Result{Moved: b.try(b.Piece.X+1, b.Piece.Y, b.Piece.Rot)}
-	case Rotate:
-		// Minimal wall kick: try in place, then one cell left/right, then two left (I piece).
-		for _, dx := range []int{0, -1, 1, -2} {
-			if b.try(b.Piece.X+dx, b.Piece.Y, b.Piece.Rot+1) {
-				return Result{Moved: true}
-			}
+	case Left, Right:
+		dx := 1
+		if a == Left {
+			dx = -1
+		}
+		grounded := b.Grounded()
+		if b.try(b.Piece.X+dx, b.Piece.Y, b.Piece.Rot) {
+			return b.moved(grounded)
 		}
 		return Result{}
-	case SoftDrop:
+	case Rotate:
+		return b.rotate(1)
+	case RotateCCW:
+		return b.rotate(3)
+	case SoftDrop: // one row down; it never locks: a resting piece locks by its lock delay
 		return b.Gravity()
 	case HardDrop:
 		for b.try(b.Piece.X, b.Piece.Y+1, b.Piece.Rot) {
 		}
-		return b.lock()
+		return b.Lock()
 	}
 	return Result{}
 }
 
-// Gravity moves the piece down one row, locking it if it cannot move.
+// Gravity moves the piece down one row if it can. A piece that cannot fall stays where it
+// is: it locks when the match's lock delay for it runs out (Lock), not here.
 func (b *Board) Gravity() Result {
 	if b.Dead {
 		return Result{}
 	}
 	if b.try(b.Piece.X, b.Piece.Y+1, b.Piece.Rot) {
+		b.fell()
 		return Result{Moved: true}
 	}
+	return Result{}
+}
+
+// Grounded reports whether the piece rests on the stack or the floor: the match runs its
+// lock delay while it does.
+func (b *Board) Grounded() bool {
+	if b.Dead {
+		return false
+	}
+	p := b.Piece
+	p.Y++
+	return !b.fits(p)
+}
+
+// Lock puts the piece into the grid where it is, clears lines, raises pending garbage and
+// spawns the next piece.
+func (b *Board) Lock() Result {
+	if b.Dead {
+		return Result{}
+	}
 	return b.lock()
+}
+
+// rotate turns the piece by turn quarters clockwise (1, or 3 for counter-clockwise),
+// trying the SRS kick offsets in order: the first position that fits wins.
+func (b *Board) rotate(turn int) Result {
+	from := b.Piece.Rot % 4
+	to := (from + turn) % 4
+	grounded := b.Grounded()
+	for _, k := range kicksFor(b.Piece.Kind, from, to) {
+		if b.try(b.Piece.X+k.X, b.Piece.Y+k.Y, to) {
+			return b.moved(grounded)
+		}
+	}
+	return Result{}
+}
+
+// moved records a successful move or rotation for the lock delay.
+func (b *Board) moved(grounded bool) Result {
+	r := Result{Moved: true}
+	b.fell()
+	if grounded && b.LockResets < MaxLockResets {
+		b.LockResets++
+		r.Extend = true
+	}
+	return r
+}
+
+// fell notes a new lowest row: the piece gets its lock delay restarts back.
+func (b *Board) fell() {
+	if b.Piece.Y > b.LowestY {
+		b.LowestY, b.LockResets = b.Piece.Y, 0
+	}
 }
 
 // GarbageFor is the attack sent for clearing n lines at once.
@@ -194,12 +262,13 @@ func (b *Board) lock() Result {
 	r := Result{Locked: true, Cleared: b.clearLines()}
 	b.Lines += r.Cleared
 	b.Score += lineScore[r.Cleared]
+	overflow := false
 	if r.Cleared == 0 && b.Pending > 0 {
 		r.Garbage = b.Pending
-		b.insertGarbage(b.Pending)
+		overflow = b.insertGarbage(b.Pending)
 		b.Pending = 0
 	}
-	if !b.spawn() {
+	if overflow || !b.spawn() {
 		b.Dead = true
 		r.Died = true
 	}
@@ -229,11 +298,21 @@ func (b *Board) clearLines() int {
 	return n
 }
 
-// insertGarbage pushes n rows with a single hole in from the bottom. Cells pushed off the
-// top are lost; the spawn check that follows decides whether the player survives.
-func (b *Board) insertGarbage(n int) {
+// insertGarbage pushes n rows with a single hole in from the bottom and reports whether
+// that pushed any locked cell off the top. That is a top-out: the attack must not just
+// shave the top of the stack.
+func (b *Board) insertGarbage(n int) bool {
 	if n > Height {
 		n = Height
+	}
+	overflow := false
+	for y := 0; y < n && !overflow; y++ {
+		for x := 0; x < Width; x++ {
+			if b.Grid[y][x] != empty {
+				overflow = true
+				break
+			}
+		}
 	}
 	copy(b.Grid[0:Height-n], b.Grid[n:])
 	hole := b.Holes.Intn(Width)
@@ -243,6 +322,7 @@ func (b *Board) insertGarbage(n int) {
 		}
 		b.Grid[y][hole] = empty
 	}
+	return overflow
 }
 
 func (b *Board) nextKind() Kind {
@@ -262,5 +342,6 @@ func (b *Board) nextKind() Kind {
 func (b *Board) spawn() bool {
 	k := b.nextKind()
 	b.Piece = Piece{Kind: k, X: (Width - shapes[k].n) / 2}
+	b.LowestY, b.LockResets = b.Piece.Y, 0
 	return b.fits(b.Piece)
 }

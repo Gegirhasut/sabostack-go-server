@@ -74,6 +74,7 @@ func main() {
 	flag.DurationVar(&c.opts.Match.RoundEndPause, "round-end-pause", c.opts.Match.RoundEndPause, "pause between rounds")
 	flag.DurationVar(&c.opts.Match.ReconnectGrace, "reconnect-grace", c.opts.Match.ReconnectGrace, "a disconnected player who is not back within this forfeits (the match never waits)")
 	flag.DurationVar(&c.opts.Match.IdleTimeout, "idle-timeout", c.opts.Match.IdleTimeout, "a connected player forfeits after this long without input")
+	flag.DurationVar(&c.opts.Match.LockDelay, "lock-delay", c.opts.Match.LockDelay, "a resting piece locks this long later; moving or turning it restarts the delay a bounded number of times (0 = lock on contact)")
 	flag.DurationVar(&c.opts.Match.ResyncWait, "resync-wait", c.opts.Match.ResyncWait, "after a restart or failover a match stands still until both players are back, for at most this (0 = off)")
 	flag.DurationVar(&c.opts.SnapshotEvery, "snapshot-every", c.opts.SnapshotEvery, "periodic snapshot interval")
 	flag.IntVar(&c.opts.PersistWorkers, "persist-workers", c.opts.PersistWorkers, "parallel snapshot writers")
