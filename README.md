@@ -28,9 +28,9 @@ One laptop, WSL2 with 8 vCPUs, server and bots on the same machine (methodology 
   ([CLUSTER.md](docs/CLUSTER.md)).
 - **~76 KB of memory and ~0.05 % of a core per player** (the growth from 2,000 to 4,000
   connections in the [load table](#load-testing-summary)). CPU is the limit, not memory.
-- **125 tests and 2 fuzz targets, all passing under `-race`.** 13 tests reproduce bugs
+- **133 tests and 2 fuzz targets, all passing under `-race`.** 13 tests reproduce bugs
   found while hardening: each fails on the code before the fix and passes after it
-  ([HARDENING.md](docs/HARDENING.md)). 33 more cover defects found later
+  ([HARDENING.md](docs/HARDENING.md)). 41 more cover defects found later
   ([HARDENING.md](docs/HARDENING.md#найдено-позже)). The store and cluster tests run
   against both miniredis and a real Redis. The load bot checks protocol invariants on
   every frame: 0 violations in the final runs.
@@ -130,14 +130,25 @@ so a restored match stands still (`paused`) until both are back, for at most 10 
 (`-resync-wait`); otherwise whoever's client reconnected first would win the round.
 Details in [ARCHITECTURE.md](docs/ARCHITECTURE.md#отключения-матч-не-ждёт).
 
-### Game rules (simplified)
+### Game rules
 
 - 10×20 board, seven tetrominoes from a 7-bag; in each round both players get the same
-  piece sequence.
+  piece sequence (the seed never reaches the clients).
+- Rotation follows SRS: its rotation states and wall-kick tables, clockwise (`rotate`)
+  and counter-clockwise (`rotate_ccw`).
+- **Lock delay:** a piece that comes to rest locks 0.5 s later (`-lock-delay`), not on
+  the gravity step that found it resting, so a player 100–150 ms from the authoritative
+  server can still slide or turn it along the floor. A move or turn of the resting piece
+  restarts the delay at most 15 times per piece (a new lowest row gives them back), so
+  nobody can hold a piece on the floor forever. `soft_drop` never locks; `hard_drop`
+  locks at once.
 - Clearing 2, 3 or 4 lines sends the opponent 1, 2 or 4 garbage rows; your own clears
-  cancel incoming garbage first.
-- A round ends on board overflow or by timer. The match is best of three (first to two
-  wins).
+  cancel incoming garbage first. Garbage that pushes your stack above the top is a
+  top-out, like a piece that cannot spawn.
+- A round ends on a top-out or by timer (the higher score wins). The match is best of
+  three (first to two wins).
+- Not implemented: the hold piece, T-spin and combo bonuses, hidden rows above the board.
+  Details: [ARCHITECTURE.md](docs/ARCHITECTURE.md#правила-игры).
 
 ## Protocol
 
@@ -151,7 +162,7 @@ subprotocol `sabostack.bin.v1` receives `state` and `pong` as binary deltas and 
 |---|---|---|
 | `join` | `name` | First message: join the queue. Name: 1–24 printable characters. |
 | `resume` | `matchId`, `token`, `lastEventSeq` | First message: return to a match after a dropped connection, a restart or a move to another node. |
-| `input` | `seq`, `action` | `left`, `right`, `rotate`, `soft_drop`, `hard_drop`. `seq` increases; duplicates are ignored. |
+| `input` | `seq`, `action` | `left`, `right`, `rotate` (clockwise), `rotate_ccw`, `soft_drop`, `hard_drop`. `seq` increases; duplicates are ignored. |
 | `ping` | `t` | Echoed as `pong`. |
 
 Client messages go through a token bucket (40/s, burst 20). A persistent flooder is
@@ -230,6 +241,7 @@ Main production flags:
 | `-node-id`, `-public-url`, `-lease`, `-shared-queue` | off, —, 10 s, on | Cluster ([CLUSTER.md](docs/CLUSTER.md)). |
 | `-drain-timeout` | 0 | On SIGTERM, stop matchmaking and let running matches finish. |
 | `-reconnect-grace`, `-idle-timeout`, `-resync-wait` | 20 s, 30 s, 10 s | Disconnect rules ([ARCHITECTURE.md](docs/ARCHITECTURE.md#отключения-матч-не-ждёт)). The server refuses to start with timings that break them (a drop noticed only after the idle timeout, pings too rare for the silence timeout, a resync wait not under the grace). |
+| `-lock-delay` | 500 ms | How long a resting piece waits before it locks (see the game rules above). |
 | `-ping-interval`, `-silence-timeout`, `-pong-wait` | 2 s, 8 s, 30 s | Heartbeat: a client heard nothing from for 8 s is marked away, its socket is closed after 30 s. Why these values: [HARDENING.md](docs/HARDENING.md#heartbeat-тишина-8-с-обрыв-30-с). |
 
 ### Production checklist
@@ -269,13 +281,13 @@ go test -run '^$' -fuzz FuzzDecodeState ./internal/wire
 - 30 s of fuzzing for each decoder;
 - a Docker image build and a run with a `/healthz` check.
 
-125 tests and 2 fuzz targets. The concurrency and cluster tests were run many times
+133 tests and 2 fuzz targets. The concurrency and cluster tests were run many times
 (`-count=20…300`) to rule out flakiness.
 
 - **Bug reproductions (13):** every bug found while hardening is covered by a test written
   against the old API: it fails with a meaningful message on the code before the fix and
   passes after it ([table](docs/HARDENING.md#баги-и-их-воспроизведение)).
-- **Defects found later (33):** IP spoofing via `X-Forwarded-For`, extra time before an
+- **Defects found later (41):** IP spoofing via `X-Forwarded-For`, extra time before an
   idle forfeit after reconnecting, self-fencing before the lease expires, retrying an
   unsaved snapshot, a leaving node is no redirect target, `pong` while queued, no double
   assignment in matchmaking, a `WaitGroup` race at shutdown, a zombie match on a fenced
@@ -283,7 +295,8 @@ go test -run '^$' -fuzz FuzzDecodeState ./internal/wire
   announced only after it is stored, snapshots of an unknown version are not deleted
   during a rollout, player tokens never reach Redis, a restored match waits for both
   players, a stalling connection does not flap away/back, silence is not idle time, an input brings a silent player back at once, timing flags are checked at
-  startup, the snapshot version is bumped with a migration
+  startup, the snapshot version is bumped with a migration, a lock delay with bounded
+  resets, SRS kicks in both directions, garbage pushed above the top is a top-out
   ([HARDENING.md](docs/HARDENING.md#найдено-позже)).
 - **Binary protocol:** 20,000 random round-trip steps, byte-for-byte equality of
   delta-built fields with the authoritative snapshot over a real WebSocket, fuzzing of
@@ -293,7 +306,8 @@ go test -run '^$' -fuzz FuzzDecodeState ./internal/wire
   two real servers where the owning node dies mid-round and the match finishes on the
   other.
 - **Game and protocol:** transition table, a full match, idempotency under `-race`,
-  timers on a fake clock, restore with shifted deadlines, message order on `resume`, a
+  the SRS kick tables (checked for symmetry and kick order), lock delay and its reset
+  limit, timers on a fake clock, restore with shifted deadlines, message order on `resume`, a
   rewind after a crash without reusing event numbers.
 - **Disconnects (fake clock):** the opponent plays on and the round timer runs while a
   player is away, the away board falls and tops out, a resume sees the board as it is now,
@@ -324,7 +338,9 @@ JSON protocol, medians over runs (raw data in `docs/loadtest/hardening/`):
 These runs used the old heartbeat (a ping every 20 s). Pinging every 2 s, as the server
 now does, was measured against it on the same bench: within noise at 1,000 pairs, about
 +4 % server CPU at 2,000 pairs (4,000 connections), memory unchanged, no errors
-([HARDENING.md](docs/HARDENING.md#стоимость-пингов-раз-в-2-с)).
+([HARDENING.md](docs/HARDENING.md#стоимость-пингов-раз-в-2-с)). The lock delay and SRS
+kicks came later still and were not measured separately; per board and gravity step they
+add one four-cell collision check.
 
 Binary protocol on the same steps (medians, [WIRE.md](docs/WIRE.md#под-нагрузкой)):
 
@@ -353,6 +369,11 @@ Binary protocol on the same steps (medians, [WIRE.md](docs/WIRE.md#под-наг
   connection must not pay for the opponent's bad one. The cost falls on the one who
   dropped: their board runs without them until they are back (a typical reconnect takes
   a few seconds).
+- **Infrastructure is opt-in.** Out of the box the server is one process with an
+  in-memory store, and clients speak JSON. Redis (`-redis`), the cluster (`-node-id`) and
+  the binary protocol (a WebSocket subprotocol the client asks for) each switch on only
+  when asked for. A game with a few hundred players needs one node; the rest is there for
+  surviving a node crash or a deploy mid-match, and costs nothing until it is turned on.
 - **Safety over availability under a partition:** a node that loses Redis for longer than
   its lease stops its matches and brings them back once Redis returns.
 - **Limitations:**
@@ -361,7 +382,7 @@ Binary protocol on the same steps (medians, [WIRE.md](docs/WIRE.md#под-наг
   - After a hard node crash, a match rewinds to its last snapshot (up to 1 s of progress).
   - No authentication, rating or anti-cheat beyond the authoritative server and the
     limits.
-  - The game rules are simplified: no hold, SRS kicks or lock delay.
+  - No hold piece, T-spin or combo bonuses, or hidden rows above the board.
 
 ## Layout
 

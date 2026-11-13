@@ -75,7 +75,7 @@ svarint eventSeq − предыдущий eventSeq
 ## Кадры клиента
 
 ```text
-input:  byte 0x10, uvarint seq, byte action (0 left, 1 right, 2 rotate, 3 soft_drop, 4 hard_drop)
+input:  byte 0x10, uvarint seq, byte action (0 left, 1 right, 2 rotate, 3 soft_drop, 4 hard_drop, 5 rotate_ccw)
 ping:   byte 0x11, svarint t
 pong:   byte 0x02, svarint t     (сервер → клиент)
 ```
