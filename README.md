@@ -16,17 +16,18 @@ my real-time PvP game for browser and Android, published on Google Play (5K+ dow
 One laptop, WSL2 with 8 vCPUs, server and bots on the same machine (methodology in
 [LOAD_TESTING.md](docs/LOAD_TESTING.md)):
 
-- **4,000 WebSocket connections (2,000 matches)** with no errors: input→ack p95 ≈ 50 ms.
-  That is almost exactly one server tick: the server batches inputs on purpose and
-  broadcasts state every 50 ms.
+- **4,000 WebSocket connections (2,000 matches)** with no errors: input→ack p95 48–87 ms
+  depending on the run and on other load on the host. One server tick is 50 ms: the server batches inputs on purpose and
+  broadcasts state once per tick.
 - **Binary delta protocol:** a state frame is 14 bytes instead of 926, encoded in 535 ns
   with zero allocations instead of 7.6 µs. Server-to-client traffic under load is
-  **18× lower**, server CPU 5–9 % lower ([WIRE.md](docs/WIRE.md)).
+  **18× lower**, server CPU 5–9 % lower at 1,000–2,000 pairs ([WIRE.md](docs/WIRE.md)).
 - **Cluster:** a node killed with SIGKILL under load — **188 of 188 players got back into
   their matches** on other nodes (within 7–13 s, depending on when the node died), 0
   errors. On a rolling deploy (SIGTERM): 206 of 206 within 3.9 s, with no lost progress
   ([CLUSTER.md](docs/CLUSTER.md)).
-- **~76 KB of memory and ~0.05 % of a core per player.** CPU is the limit, not memory.
+- **~76 KB of memory and ~0.05 % of a core per player** (the growth from 2,000 to 4,000
+  connections in the [load table](#load-testing-summary)). CPU is the limit, not memory.
 - **125 tests and 2 fuzz targets, all passing under `-race`.** 13 tests reproduce bugs
   found while hardening: each fails on the code before the fix and passes after it
   ([HARDENING.md](docs/HARDENING.md)). 33 more cover defects found later
@@ -163,7 +164,7 @@ disconnected with `rate_limited`.
 | `queued` | | After `join`. |
 | `matched` | `matchId`, `seat`, `token`, `opponent`, `url` | Opponent found. If `url` is set, the match runs on another node: connect there and `resume`. |
 | `snapshot` | `matchId`, `seat`, `state`, `events[]`, `eventsComplete` | Always the first message after attaching to a match. `eventsComplete=false` means the client's history is invalid (the log is shorter, or the match rewound to a snapshot after a node crash): trust `state`, resend unacknowledged inputs. While `state.paused` is true (a restored match waiting for both players), send no inputs and drop the unacknowledged ones: the server acks and drops them; send again after the `resumed` event. |
-| `state` | `tick`, `phase`, `round`, `paused`, `remainingMs`, `ack`, `eventSeq`, `players[]` | At most once per tick, and only on change. An unsent `state` is replaced by a newer one. `paused` is `true` only while a restored match waits for its players after a restart or failover (`remainingMs` stands still, inputs are not applied); a disconnect never pauses a match. `players[i].connected` is `false` while that player is away. |
+| `state` | `tick`, `phase`, `round`, `paused`, `remainingMs`, `ack`, `eventSeq`, `players[]` | At most once per tick, and only on change. An unsent `state` is replaced by a newer one. `paused` is `true` only while a restored match waits for its players after a restart or failover (`remainingMs` stands still, inputs are acked and dropped); a disconnect never pauses a match. `players[i].connected` is `false` while that player is away. |
 | `event` | `event: {seq, atMs, kind, ...}` | `phase`, `cleared`, `garbage`, `round_over`, `match_over`, `player_left`, `player_back`, `resumed` (a restored match runs again). Never lost or reordered. `paused` is no longer sent; ignore unknown kinds. |
 | `error` | `code`, `message`, `url` | `wrong_server` (reconnect to `url`), `match_moving` (the match's node died and it is being taken over — retry), `match_not_found`, `bad_token`, `rate_limited`, `unavailable`, `bad_name`, `bad_request`, `bad_json`, `timeout`. |
 | `pong` | `t` | |
