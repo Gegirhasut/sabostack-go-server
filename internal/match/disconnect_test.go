@@ -373,8 +373,10 @@ func TestSilentConnectionCountsAsAway(t *testing.T) {
 	if got := now.Sub(run); got != steady {
 		t.Fatalf("back %s after being heard steadily again, want %s", got, steady)
 	}
-	if got, want := m.Seats[1].LastInput.Sub(lastInput), now.Sub(silentAt); got != want {
-		t.Fatalf("idle clock moved %s on the return, want the %s away", got, want)
+	// The idle clock stopped when bob was last heard (start), not when the silence was
+	// noticed: the silence is no idle time either.
+	if got, want := m.Seats[1].LastInput.Sub(lastInput), now.Sub(start); got != want {
+		t.Fatalf("idle clock moved %s on the return, want the %s since bob was last heard", got, want)
 	}
 	if bob.snapshots() != snaps {
 		t.Fatal("a connection heard again was sent a snapshot")
@@ -445,8 +447,8 @@ func TestRestoredMatchWaitsForBothPlayers(t *testing.T) {
 			t.Fatalf("%s into the wait: paused=%v remaining=%dms piece y %d->%d", at.Sub(restoredAt), st.Paused, st.RemainingMs, y, r.Seats[0].Board.Piece.Y)
 		}
 	}
-	if got := r.Input(0, 2, game.Left, back); got != InputNotPlaying {
-		t.Fatalf("input while resyncing: %s", got)
+	if got := r.Input(0, 2, game.Left, back); got != InputNotPlaying || r.Seats[0].LastSeq != 1 {
+		t.Fatalf("input while resyncing: %s, lastSeq %d (want it not acked, so the client resends it)", got, r.Seats[0].LastSeq)
 	}
 	if _, err := r.Attach(tokens[1], &fakeSink{}, 0, back); err != nil {
 		t.Fatal(err)
@@ -461,8 +463,8 @@ func TestRestoredMatchWaitsForBothPlayers(t *testing.T) {
 	if got := back.Sub(r.Seats[1].LastInput); got != idle {
 		t.Fatalf("idle %s after the wait, want the %s it had", got, idle)
 	}
-	if got := r.Input(0, 3, game.Left, back); got != InputApplied {
-		t.Fatalf("input after the resume: %s", got)
+	if got := r.Input(0, 2, game.Left, back); got != InputApplied {
+		t.Fatalf("the input resent after the resume: %s", got)
 	}
 }
 
@@ -701,6 +703,13 @@ func TestTakeoverWithAwayPlayer(t *testing.T) {
 	var y int
 	inspect(t, b, func(m *Match) { y = m.Seats[1].Board.Piece.Y })
 	tick := mgrB.opts.Match.TickInterval
+	// Seat 1 is not coming back, so the match stands for the whole resync wait first.
+	clk.Advance(mgrB.opts.Match.ResyncWait)
+	inspect(t, b, func(m *Match) {
+		if m.resyncing() {
+			t.Fatal("still resyncing after the resync wait")
+		}
+	})
 	for seq := uint64(2); clk.Now().Add(time.Second).Before(forfeit); seq++ {
 		b.Input(0, seq, game.Rotate)
 		inspect(t, b, func(m *Match) {
@@ -742,5 +751,79 @@ func TestGraceAndIdleOnOneTick(t *testing.T) {
 	}
 	if m.Phase != MatchEnd || m.Winner != NoSeat || m.EndReason != "disconnected_and_idle" {
 		t.Fatalf("phase=%s winner=%d reason=%s", m.Phase, m.Winner, m.EndReason)
+	}
+}
+
+// Bug: the idle clock ran until the silence was noticed. A player who thought for 25 s
+// and then lost the network lost by idle at 30 s, before the 8 s silence timeout marked
+// them away, and the 8 s of silence counted as idle time even when it was caught in
+// time. Now the idle clock of a quiet connection only counts to when it was last heard.
+func TestSilenceIsNotIdleTime(t *testing.T) {
+	cfg := testConfig()
+	cfg.Gravity = time.Hour
+	m, tokens, sinks, start := newPlaying(t, cfg)
+	bob := &heardSink{}
+	bob.hear(start)
+	if _, err := m.Attach(tokens[1], bob, 0, start); err != nil {
+		t.Fatal(err)
+	}
+	dropped := start.Add(cfg.IdleTimeout - cfg.SilenceTimeout + 2*time.Second) // thinks, then the network goes
+	noticed := dropped.Add(cfg.SilenceTimeout)
+	var seq uint64
+	for now := start; !now.After(noticed); now = now.Add(cfg.TickInterval) {
+		if !now.After(dropped) {
+			bob.hear(now) // pongs only: bob makes no move
+		}
+		if now.Sub(start)%time.Second == 0 {
+			seq++
+			m.Input(0, seq, game.Rotate, now)
+		}
+		m.Advance(now)
+		if m.Phase != Playing {
+			t.Fatalf("%s after the drop: %s (winner %d)", now.Sub(dropped), m.EndReason, m.Winner)
+		}
+	}
+	s := m.Seats[1]
+	if s.Connected || !s.LeftAt.Equal(noticed) || !s.IdleStop.Equal(dropped) {
+		t.Fatalf("connected=%v leftAt=+%s idleStop=+%s, want away from the notice and idle stopped at the drop",
+			s.Connected, s.LeftAt.Sub(dropped), s.IdleStop.Sub(dropped))
+	}
+	_ = sinks
+}
+
+// An input from a seat marked away by silence brings it back at once: the steady-contact
+// wait is for pongs, which a stalling connection can still let through, not for moves.
+func TestInputBringsSilentSeatBack(t *testing.T) {
+	cfg := testConfig()
+	cfg.Gravity = time.Hour
+	m, tokens, sinks, start := newPlaying(t, cfg)
+	bob := &heardSink{}
+	bob.hear(start)
+	if _, err := m.Attach(tokens[1], bob, 0, start); err != nil {
+		t.Fatal(err)
+	}
+	now := start.Add(cfg.SilenceTimeout)
+	m.Advance(now)
+	if m.Seats[1].Connected {
+		t.Fatal("bob not marked away by silence")
+	}
+	snaps := bob.snapshots()
+	now = now.Add(time.Second)
+	bob.hear(now)
+	if got := m.Input(1, 1, game.Left, now); got != InputApplied {
+		t.Fatalf("input from the silent seat: %s", got)
+	}
+	if !m.Seats[1].Connected || m.Seats[1].LeftAt != (time.Time{}) {
+		t.Fatal("an input did not bring the silent seat back")
+	}
+	if evs := sinks[0].events(); evs[len(evs)-1].Kind != protocol.EvPlayerBack {
+		t.Fatalf("opponent's last event %+v, want player_back", evs[len(evs)-1])
+	}
+	if bob.snapshots() != snaps {
+		t.Fatal("the seat brought back by an input was sent a snapshot")
+	}
+	m.Advance(now.Add(cfg.TickInterval))
+	if !m.Seats[1].Connected {
+		t.Fatal("the next tick marked the seat away again")
 	}
 }

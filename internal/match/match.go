@@ -303,6 +303,11 @@ func (m *Match) watchSilence(now time.Time) {
 		switch {
 		case s.Connected && quiet >= limit:
 			m.away(i, now)
+			// The grace runs from now (the player gets the benefit of the doubt), but the
+			// idle clock stopped when the connection did: the silence is not idle time.
+			if last.Before(s.IdleStop) {
+				s.IdleStop = last
+			}
 			m.touch()
 		case !s.Connected && !s.heardSince.IsZero() && now.Sub(s.heardSince) >= limit/2:
 			m.back(i, now)
@@ -328,7 +333,12 @@ func (m *Match) Detach(seat int, sink Sink, now time.Time) {
 
 // Input applies a player action. seq makes inputs idempotent: anything at or below the
 // last consumed seq is dropped. A seq is consumed even when the action is ignored because
-// of the phase, so a retransmit can never be applied later in a different round.
+// of the phase, so a retransmit can never be applied later in a different round. The
+// exception is a match resyncing after a restore: the input is not acked there, so the
+// client resends it and it applies once the match runs again (the same round).
+//
+// An input is proof the player is there: one from a seat marked away by silence brings
+// it back at once, without the steady-contact wait that pongs need (see watchSilence).
 func (m *Match) Input(seat int, seq uint64, a game.Action, now time.Time) InputResult {
 	s := m.Seats[seat]
 	if seq <= s.LastSeq {
@@ -337,9 +347,16 @@ func (m *Match) Input(seat int, seq uint64, a game.Action, now time.Time) InputR
 	if !a.Valid() {
 		return InputInvalid
 	}
+	if !s.Connected && s.sink != nil { // silent, socket still attached
+		m.back(seat, now)
+		m.touch()
+	}
+	if m.resyncing() {
+		return InputNotPlaying
+	}
 	s.LastSeq = seq
 	m.touch() // the ack changed even if nothing else did
-	if m.Phase != Playing || m.resyncing() {
+	if m.Phase != Playing {
 		return InputNotPlaying
 	}
 	s.LastInput = now
@@ -404,7 +421,7 @@ func (m *Match) forfeit(now time.Time) bool {
 		case away[i]:
 			gone[i] = now.Sub(s.LeftAt) >= m.cfg.ReconnectGrace
 		case m.Phase == Playing:
-			gone[i] = now.Sub(s.LastInput) >= m.cfg.IdleTimeout
+			gone[i] = m.heardUntil(s, now).Sub(s.LastInput) >= m.cfg.IdleTimeout
 		}
 	}
 	switch {
@@ -425,6 +442,23 @@ func (m *Match) forfeit(now time.Time) bool {
 		return false
 	}
 	return true
+}
+
+// heardUntil is how far the idle clock of a connected seat may count: to now, unless its
+// connection has been quiet for SilenceTimeout/2 or more, and then only to when it was
+// last heard. Such a connection may have dropped without the silence timeout having
+// caught it yet; without this a player who thought for 25 s and then lost the network
+// would lose by idle a few seconds before being marked away. A live client answers the
+// server's pings every couple of seconds, so for it this is always now.
+func (m *Match) heardUntil(s *Seat, now time.Time) time.Time {
+	h, ok := s.sink.(Heard)
+	if !ok || m.cfg.SilenceTimeout <= 0 {
+		return now
+	}
+	if last := h.LastHeard(); now.Sub(last) >= m.cfg.SilenceTimeout/2 {
+		return last
+	}
+	return now
 }
 
 func forfeitReason(away bool) string {

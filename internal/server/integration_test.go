@@ -315,8 +315,10 @@ func TestResumeAfterServerRestart(t *testing.T) {
 	}
 	bob.waitFor(protocol.TypeSnapshot, nil)
 
-	// Seq 1 was consumed before the restart, so a retransmit is ignored; seq 2 applies.
-	// The restored match runs at once: nothing waits for both players to be back.
+	// The restored match stood still until both were back (inputs before that are not
+	// acked, and a client resends them). Seq 1 was consumed before the restart, so a
+	// retransmit is ignored; seq 2 applies.
+	alice.waitFor(protocol.TypeEvent, isEvent(protocol.EvResumed))
 	alice.send(protocol.ClientMsg{Type: protocol.TypeInput, Seq: 1, Action: "hard_drop"})
 	alice.send(protocol.ClientMsg{Type: protocol.TypeInput, Seq: 2, Action: "left"})
 	alice.waitFor(protocol.TypeState, func(b []byte) bool { return decode[protocol.State](t, b).Ack == 2 })

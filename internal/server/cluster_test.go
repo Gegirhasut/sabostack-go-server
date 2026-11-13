@@ -198,7 +198,9 @@ func TestClusterCrossNodeMatchSurvivesNodeCrash(t *testing.T) {
 	}
 	bob, _ = resumeAnywhere(t, other.url, mb, 0)
 
-	// The seq consumed before the crash is still deduplicated on the new server.
+	// The seq consumed before the crash is still deduplicated on the new server (once the
+	// adopted match runs again: it waits for both players).
+	alice.waitFor(protocol.TypeEvent, isEvent(protocol.EvResumed))
 	alice.send(protocol.ClientMsg{Type: protocol.TypeInput, Seq: 1, Action: "left"})
 	alice.send(protocol.ClientMsg{Type: protocol.TypeInput, Seq: 2, Action: "left"})
 	alice.waitFor(protocol.TypeState, func(b []byte) bool { return decode[protocol.State](t, b).Ack == 2 })
