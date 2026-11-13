@@ -20,7 +20,10 @@ import (
 // Version 3: a resting piece locks after the lock delay (seat lockAt, board lockResets
 // and lowestY), not on the gravity step that found it resting. A version-2 build would
 // ignore those fields and lock at once: one match, two sets of rules.
-const snapshotVersion = 3
+//
+// Version 4: a piece lives at most Config.PieceLimit (seat pieceAt). A version-3 build
+// would ignore the field and let a piece walked down a staircase of ledges live on.
+const snapshotVersion = 4
 
 // snapshotMigrations[v] turns the "match" object of a version-v snapshot into version
 // v+1. A snapshot older than the oldest registered migration, or newer than this build,
@@ -29,7 +32,13 @@ const snapshotVersion = 3
 var snapshotMigrations = map[int]func(json.RawMessage) (json.RawMessage, error){
 	1: migrateV1,
 	2: migrateV2,
+	3: migrateV3,
 }
+
+// migrateV3 turns a version-3 match into version 4. Nothing to rewrite: without pieceAt
+// the piece's age starts at the next play step, so a restored piece gets at most one
+// extra PieceLimit.
+func migrateV3(raw json.RawMessage) (json.RawMessage, error) { return raw, nil }
 
 // migrateV2 turns a version-2 match into version 3. Nothing to rewrite: without lockAt a
 // resting piece gets its lock delay on the next gravity step, and the reset counters

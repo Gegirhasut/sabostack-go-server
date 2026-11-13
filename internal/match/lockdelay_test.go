@@ -1,6 +1,7 @@
 package match
 
 import (
+	"encoding/json"
 	"math/rand/v2"
 	"testing"
 	"time"
@@ -269,5 +270,59 @@ func TestRandomPlayLocksEveryPieceInTime(t *testing.T) {
 	t.Logf("%d pieces", pieces)
 	if pieces < 50 {
 		t.Fatalf("only %d pieces played: the test did not exercise locking", pieces)
+	}
+}
+
+// A version-3 snapshot has no pieceAt. Restored by this build, the piece's age starts at
+// the first play step after the resync, so the piece still gets a limit.
+func TestVersion3SnapshotGetsAPieceLimit(t *testing.T) {
+	cfg := testConfig()
+	m, tokens, _, start := newPlaying(t, cfg)
+	m.Advance(start)
+	data, err := m.Snapshot(start)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var snap map[string]json.RawMessage
+	if err := json.Unmarshal(data, &snap); err != nil {
+		t.Fatal(err)
+	}
+	var match map[string]json.RawMessage
+	if err := json.Unmarshal(snap["match"], &match); err != nil {
+		t.Fatal(err)
+	}
+	var seats []map[string]json.RawMessage
+	if err := json.Unmarshal(match["seats"], &seats); err != nil {
+		t.Fatal(err)
+	}
+	for _, s := range seats {
+		delete(s, "pieceAt")
+	}
+	match["seats"], _ = json.Marshal(seats)
+	snap["match"], _ = json.Marshal(match)
+	snap["version"] = json.RawMessage("3")
+	old, _ := json.Marshal(snap)
+	if !SnapshotSupported(old) {
+		t.Fatal("this build refuses a version-3 snapshot")
+	}
+
+	at := start.Add(time.Minute)
+	r, err := Restore(old, cfg, at)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for i, tok := range tokens {
+		if _, err := r.Attach(tok, &fakeSink{}, 0, at); err != nil {
+			t.Fatalf("attach %d: %v", i, err)
+		}
+	}
+	r.Advance(at)
+	for i, s := range r.Seats {
+		if lockedCells(s.Board) != 0 {
+			t.Fatalf("seat %d: the restored piece was dropped at once, as if it had lived since the zero time", i)
+		}
+		if !s.PieceAt.Equal(at) {
+			t.Fatalf("seat %d: piece age starts at %v, want the first play step %v", i, s.PieceAt, at)
+		}
 	}
 }

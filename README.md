@@ -28,7 +28,7 @@ One laptop, WSL2 with 8 vCPUs, server and bots on the same machine (methodology 
   ([CLUSTER.md](docs/CLUSTER.md)).
 - **~76 KB of memory and ~0.05 % of a core per player** (the growth from 2,000 to 4,000
   connections in the [load table](#load-testing-summary)). CPU is the limit, not memory.
-- **137 tests and 2 fuzz targets, all passing under `-race`.** 13 tests reproduce bugs
+- **138 tests and 2 fuzz targets, all passing under `-race`.** 13 tests reproduce bugs
   found while hardening: each fails on the code before the fix and passes after it
   ([HARDENING.md](docs/HARDENING.md)). 45 more cover defects found later
   ([HARDENING.md](docs/HARDENING.md#найдено-позже)). The store and cluster tests run
@@ -286,7 +286,7 @@ go test -run '^$' -fuzz FuzzDecodeState ./internal/wire
 - 30 s of fuzzing for each decoder;
 - a Docker image build and a run with a `/healthz` check.
 
-137 tests and 2 fuzz targets. The concurrency and cluster tests were run many times
+138 tests and 2 fuzz targets. The concurrency and cluster tests were run many times
 (`-count=20…300`) to rule out flakiness.
 
 - **Bug reproductions (13):** every bug found while hardening is covered by a test written
