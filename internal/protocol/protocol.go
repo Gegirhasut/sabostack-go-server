@@ -84,8 +84,9 @@ type State struct {
 	Round int    `json:"round"`
 	// Paused: the match stands still while it resyncs after a server restart or a
 	// failover, until both players are back or for at most the server's resync wait
-	// (see the "paused"/"resumed" events). A player's disconnect never pauses a match.
-	// RemainingMs does not run down meanwhile, and inputs are not applied.
+	// (the "resumed" event marks the end). A player's disconnect never pauses a match.
+	// RemainingMs does not run down meanwhile, and inputs are acked and dropped: the
+	// client sends none while paused and drops its unacknowledged ones.
 	Paused      bool         `json:"paused"`
 	RemainingMs int64        `json:"remainingMs"` // until the current phase deadline
 	Ack         uint64       `json:"ack"`
