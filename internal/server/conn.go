@@ -119,11 +119,11 @@ func newClient(ws *websocket.Conn, limits connLimits, binary bool) *client {
 	return c
 }
 
-// lastHeard is when the client last sent anything: a message of any kind, or a pong to
-// the server's ping. Browsers and WebSocket libraries answer pings by themselves, so a
-// live connection is heard at least once per ping interval even when the player is not
-// touching anything.
-func (c *client) lastHeard() time.Time { return time.Unix(0, c.heard.Load()) }
+// LastHeard is when the client last sent anything: a message of any kind, or a pong to
+// the server's ping (match.Heard). Browsers and WebSocket libraries answer pings by
+// themselves, so a live connection is heard at least once per ping interval even when
+// the player is not touching anything.
+func (c *client) LastHeard() time.Time { return time.Unix(0, c.heard.Load()) }
 
 // Send queues msg for the writer goroutine.
 func (c *client) Send(msg any) bool {

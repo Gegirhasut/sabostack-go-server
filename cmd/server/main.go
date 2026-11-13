@@ -64,7 +64,7 @@ func main() {
 	flag.Float64Var(&c.srv.InputBurst, "input-burst", c.srv.InputBurst, "burst allowance for -input-rate")
 	flag.DurationVar(&c.srv.PingInterval, "ping-interval", c.srv.PingInterval, "server WebSocket ping interval")
 	flag.DurationVar(&c.srv.PongWait, "pong-wait", c.srv.PongWait, "a silent socket is closed after this")
-	flag.DurationVar(&c.srv.SilenceTimeout, "silence-timeout", c.srv.SilenceTimeout, "a player silent this long (no message, no pong) is marked disconnected and the reconnect grace starts (0 = off)")
+	flag.DurationVar(&c.opts.Match.SilenceTimeout, "silence-timeout", c.opts.Match.SilenceTimeout, "a player silent this long (no message, no pong) is marked disconnected and the reconnect grace starts (0 = off)")
 	flag.BoolVar(&c.srv.BinaryFullFrames, "binary-full-frames", false, "send binary clients full state frames instead of deltas (for measurements)")
 	flag.DurationVar(&c.opts.Match.TickInterval, "tick", c.opts.Match.TickInterval, "server tick interval")
 	flag.DurationVar(&c.opts.Match.Gravity, "gravity", c.opts.Match.Gravity, "gravity interval")
@@ -73,6 +73,7 @@ func main() {
 	flag.DurationVar(&c.opts.Match.RoundEndPause, "round-end-pause", c.opts.Match.RoundEndPause, "pause between rounds")
 	flag.DurationVar(&c.opts.Match.ReconnectGrace, "reconnect-grace", c.opts.Match.ReconnectGrace, "a disconnected player who is not back within this forfeits (the match never waits)")
 	flag.DurationVar(&c.opts.Match.IdleTimeout, "idle-timeout", c.opts.Match.IdleTimeout, "a connected player forfeits after this long without input")
+	flag.DurationVar(&c.opts.Match.ResyncWait, "resync-wait", c.opts.Match.ResyncWait, "after a restart or failover a match stands still until both players are back, for at most this (0 = off)")
 	flag.DurationVar(&c.opts.SnapshotEvery, "snapshot-every", c.opts.SnapshotEvery, "periodic snapshot interval")
 	flag.IntVar(&c.opts.PersistWorkers, "persist-workers", c.opts.PersistWorkers, "parallel snapshot writers")
 	flag.Parse()
@@ -141,7 +142,8 @@ func run(log *slog.Logger, c config) error {
 	if c.srv.PublicMetrics {
 		log.Warn("/metrics is served on the public address (set -admin-addr and -public-metrics=false in production)")
 	}
-	if c.srv.SilenceTimeout > 0 && c.srv.PingInterval*2 > c.srv.SilenceTimeout {
+
+	if m := c.opts.Match; m.SilenceTimeout > 0 && c.srv.PingInterval*2 > m.SilenceTimeout {
 		log.Warn("-ping-interval is over half of -silence-timeout: players who are connected but not moving will be marked disconnected")
 	}
 

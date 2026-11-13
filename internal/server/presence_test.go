@@ -2,8 +2,8 @@ package server
 
 // Server-side detection of dead clients. A half-open connection (the phone changed
 // networks; no close ever arrives) is only noticed by silence: after SilenceTimeout
-// without a message or a pong, the seat is marked away and the reconnect grace starts,
-// while the socket stays open in case the client was only slow.
+// without a message or a pong, the match marks the seat away and the reconnect grace
+// starts, while the socket stays open in case the client was only slow.
 
 import (
 	"context"
@@ -54,9 +54,10 @@ func seatEvent(kind string, seat int) func([]byte) bool {
 }
 
 // Deterministic, on the match clock: a client that sends nothing for SilenceTimeout is
-// marked away while its socket stays open, comes back the moment it is heard again
-// (no snapshot needed: it never missed a message), and when it goes silent for good it
-// forfeits once the grace that started with the silence runs out.
+// marked away while its socket stays open, comes back once it has been heard from
+// steadily for SilenceTimeout/2 (no snapshot needed: it never missed a message), and
+// when it goes silent for good it forfeits once the grace that started with the silence
+// runs out.
 func TestSilentClientIsMarkedAwayAndBack(t *testing.T) {
 	start := time.Date(2026, 1, 1, 12, 0, 0, 0, time.UTC)
 	clk := clock.NewFake(start)
@@ -66,7 +67,7 @@ func TestSilentClientIsMarkedAwayAndBack(t *testing.T) {
 	cfg := DefaultConfig()
 	cfg.InputRate = 0
 	cfg.PingInterval = time.Hour // no server pings: here only messages count as being heard
-	silence := cfg.SilenceTimeout
+	silence := opts.Match.SilenceTimeout
 	ts := startServerOn(t, store.NewMemory(), clk, opts, cfg)
 
 	alice, bob, ma, _ := joinPair(t, ts.url)
@@ -111,9 +112,21 @@ func TestSilentClientIsMarkedAwayAndBack(t *testing.T) {
 		t.Fatalf("bob marked away %s after his last message, want %s", away, silence)
 	}
 
-	// Bob was only slow: one message and he is back, on the same socket.
-	ping(bob)
-	alice.waitFor(protocol.TypeEvent, seatEvent(protocol.EvPlayerBack, 1))
+	// Bob was only slow: he talks steadily again and is back, on the same socket.
+	// (Bob's messages are only sent here, not waited on, so everything the server sends
+	// him stays in bob.msgs for the check below.)
+	heardAgain := clk.Now()
+	sawBack := false
+	for i := int64(0); clk.Now().Sub(heardAgain) <= silence/2+opts.Match.TickInterval; i++ {
+		bob.send(protocol.ClientMsg{Type: protocol.TypePing, T: 1000 + i})
+		for _, e := range ping(alice) { // by its pong the server has read bob's message too
+			sawBack = sawBack || e.Kind == protocol.EvPlayerBack && e.Seat != nil && *e.Seat == 1
+		}
+		advance(opts.Match.TickInterval)
+	}
+	if !sawBack {
+		alice.waitFor(protocol.TypeEvent, seatEvent(protocol.EvPlayerBack, 1))
+	}
 	for back := false; !back; {
 		select {
 		case e := <-bob.msgs:
@@ -170,7 +183,7 @@ func TestSilenceIsJudgedByPongsToo(t *testing.T) {
 	opts.Match.Gravity, opts.Match.IdleTimeout = time.Hour, time.Hour
 	cfg := DefaultConfig()
 	cfg.InputRate = 0
-	cfg.PingInterval, cfg.SilenceTimeout = 20*time.Millisecond, time.Second
+	cfg.PingInterval, opts.Match.SilenceTimeout = 20*time.Millisecond, time.Second
 	ts := startServerOn(t, store.NewMemory(), clock.Real{}, opts, cfg)
 
 	alice := dial(t, ts.url) // gorilla's default ping handler answers every ping
@@ -183,7 +196,7 @@ func TestSilenceIsJudgedByPongsToo(t *testing.T) {
 
 	// Neither sends anything from here on.
 	alice.waitFor(protocol.TypeEvent, seatEvent(protocol.EvPlayerLeft, 1))
-	time.Sleep(2 * cfg.SilenceTimeout)
+	time.Sleep(2 * opts.Match.SilenceTimeout)
 	actor, _ := ts.srv.mgr.Get(ma.MatchID)
 	var connected [2]bool
 	if err := actor.Inspect(context.Background(), func(m *match.Match) {
@@ -192,8 +205,20 @@ func TestSilenceIsJudgedByPongsToo(t *testing.T) {
 		t.Fatal(err)
 	}
 	if connected != [2]bool{true, false} {
-		t.Fatalf("connected = %v after %s of quiet, want the ping-answering client present", connected, 2*cfg.SilenceTimeout)
+		t.Fatalf("connected = %v after %s of quiet, want the ping-answering client present", connected, 2*opts.Match.SilenceTimeout)
 	}
-	deaf.send(protocol.ClientMsg{Type: protocol.TypePing, T: 1})
+	// Anything it sends counts; heard steadily, it comes back.
+	stop := make(chan struct{})
+	defer close(stop)
+	go func() {
+		for i := int64(1); ; i++ {
+			select {
+			case <-stop:
+				return
+			case <-time.After(50 * time.Millisecond):
+				deaf.send(protocol.ClientMsg{Type: protocol.TypePing, T: i})
+			}
+		}
+	}()
 	alice.waitFor(protocol.TypeEvent, seatEvent(protocol.EvPlayerBack, 1))
 }

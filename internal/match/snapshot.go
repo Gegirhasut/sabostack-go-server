@@ -11,16 +11,54 @@ import (
 // changes, and register a migration from the previous version in snapshotMigrations, so a
 // rolling deploy can restore and adopt the matches the old build left behind.
 //
-// Dropping the pause fields (pausedAt, awayUsed) did not need a bump: a build without
-// them ignores them in old snapshots (Restore), and a build with them reads their
-// absence as "not paused, nothing used".
-const snapshotVersion = 1
+// Version 2: a disconnect no longer pauses the match (a match only stands still while it
+// resyncs after a restore: resyncFrom/resyncUntil), and the idle clock stops at its own
+// idleStop instead of at leftAt. The same version-1 snapshot meant a paused match to one
+// build and a running one to the next, so a mixed cluster would have run one match two
+// ways; with the bump a version-1 node leaves version-2 matches alone.
+const snapshotVersion = 2
 
 // snapshotMigrations[v] turns the "match" object of a version-v snapshot into version
 // v+1. A snapshot older than the oldest registered migration, or newer than this build,
 // is not ours to run: it is left alone (the store's TTL removes it), never deleted, since
 // a node of the right version may still need it.
-var snapshotMigrations = map[int]func(json.RawMessage) (json.RawMessage, error){}
+var snapshotMigrations = map[int]func(json.RawMessage) (json.RawMessage, error){
+	1: migrateV1,
+}
+
+// migrateV1 turns a version-1 match into version 2. A version-1 build that paused
+// matches kept their clocks still from "pausedAt": that is exactly what resyncFrom means
+// now, so Restore resumes the clocks from there and the round keeps the time it had left
+// when it froze. The pause budget ("awayUsed") is gone. The idle clock of an away
+// player stood from the moment they left, so idleStop starts as leftAt.
+func migrateV1(raw json.RawMessage) (json.RawMessage, error) {
+	var m map[string]json.RawMessage
+	if err := json.Unmarshal(raw, &m); err != nil {
+		return nil, err
+	}
+	if at, ok := m["pausedAt"]; ok {
+		m["resyncFrom"] = at
+		delete(m, "pausedAt")
+	}
+	var seats []map[string]json.RawMessage
+	if err := json.Unmarshal(m["seats"], &seats); err != nil {
+		return nil, err
+	}
+	for _, seat := range seats {
+		if seat == nil {
+			continue
+		}
+		delete(seat, "awayUsed")
+		if left, ok := seat["leftAt"]; ok {
+			seat["idleStop"] = left
+		}
+	}
+	var err error
+	if m["seats"], err = json.Marshal(seats); err != nil {
+		return nil, err
+	}
+	return json.Marshal(m)
+}
 
 // ErrSnapshotVersion means the snapshot was written in a format this build cannot run.
 var ErrSnapshotVersion = errors.New("match: unsupported snapshot version")
@@ -92,14 +130,15 @@ func (m *Match) snapshot(now time.Time, final bool) ([]byte, error) {
 //
 // Every deadline is shifted forward by the downtime, so the process being dead does not
 // eat into round or countdown time. All players start disconnected (their sockets died
-// with the old process) and the match runs on from now like any other: boards fall, the
-// round timer runs, and each player has the normal reconnect grace, counted from now, to
-// resume.
+// with the old process), and each has the normal reconnect grace, counted from now, to
+// resume. Until both are back, or for at most cfg.ResyncWait, a match in Countdown,
+// Playing or RoundEnd stands still (state.paused): a failover takes seconds, and
+// without the wait the player whose client finds the new node first would get free
+// round time on a falling board the other cannot touch. A disconnect alone never
+// pauses a match; this stand-still is the server's own failure.
 //
-// Snapshots written by builds that still paused matches can carry "pausedAt" and
-// "awayUsed". Neither is a field any more and neither survives a restore. A paused
-// match's clocks stood still from pausedAt, though, so pausedAt is read once to resume
-// them from there: the round keeps the time it had left when it froze.
+// A snapshot taken while a match stood still (resyncFrom set) resumes its clocks from
+// resyncFrom, not from the snapshot time: the round keeps the time it had left.
 func Restore(data []byte, cfg Config, now time.Time) (*Match, error) {
 	var s snapshotHeader
 	if err := json.Unmarshal(data, &s); err != nil {
@@ -125,22 +164,27 @@ func Restore(data []byte, cfg Config, now time.Time) (*Match, error) {
 	m.cfg = cfg
 	shift := now.Sub(s.SavedAt)
 	play := shift // for the game clocks: round/countdown deadline, gravity, idle
-	var legacy struct {
-		PausedAt time.Time `json:"pausedAt"`
+	if !m.ResyncFrom.IsZero() && !m.ResyncFrom.After(s.SavedAt) {
+		play = now.Sub(m.ResyncFrom) // they stood still since then
 	}
-	if json.Unmarshal(raw, &legacy) == nil && !legacy.PausedAt.IsZero() && legacy.PausedAt.Before(s.SavedAt) {
-		play = now.Sub(legacy.PausedAt)
-	}
+	m.ResyncFrom, m.ResyncUntil = time.Time{}, time.Time{}
 	shiftTime(&m.PhaseEnds, play)
 	shiftTime(&m.NextGravity, play)
 	shiftTime(&m.EndedAt, shift)
 	for _, seat := range m.Seats {
 		shiftTime(&seat.LastInput, play)
+		shiftTime(&seat.IdleStop, play)
 		if seat.Connected || seat.LeftAt.IsZero() {
 			seat.Connected, seat.LeftAt = false, now
 		} else {
 			shiftTime(&seat.LeftAt, shift)
 		}
+		if seat.IdleStop.IsZero() || seat.IdleStop.After(now) {
+			seat.IdleStop = now
+		}
+	}
+	if cfg.ResyncWait > 0 && (m.Phase == Countdown || m.Phase == Playing || m.Phase == RoundEnd) {
+		m.ResyncFrom, m.ResyncUntil = now, now.Add(cfg.ResyncWait)
 	}
 	if !s.Final {
 		// The state rewound to this snapshot: whatever happened after it is gone. Skip the

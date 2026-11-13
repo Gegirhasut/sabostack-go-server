@@ -36,6 +36,41 @@ func (s *fakeSink) Close(reason string) {
 	s.closed = reason
 }
 
+func (s *fakeSink) count() int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return len(s.msgs)
+}
+
+func (s *fakeSink) snapshots() (n int) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for _, m := range s.msgs {
+		if _, ok := m.(protocol.Snapshot); ok {
+			n++
+		}
+	}
+	return n
+}
+
+// heardSink is a fakeSink that says when its client was last heard from (Heard).
+type heardSink struct {
+	fakeSink
+	last time.Time
+}
+
+func (s *heardSink) hear(at time.Time) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.last = at
+}
+
+func (s *heardSink) LastHeard() time.Time {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.last
+}
+
 func (s *fakeSink) events() []protocol.Event {
 	s.mu.Lock()
 	defer s.mu.Unlock()

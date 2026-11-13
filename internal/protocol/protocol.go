@@ -82,9 +82,10 @@ type State struct {
 	Tick  uint64 `json:"tick"`
 	Phase string `json:"phase"`
 	Round int    `json:"round"`
-	// Paused is always false: matches no longer pause when a player disconnects. The
-	// field (and bit 3 of a binary state frame) stays on the wire so that clients which
-	// read it keep working; new clients should ignore it.
+	// Paused: the match stands still while it resyncs after a server restart or a
+	// failover, until both players are back or for at most the server's resync wait
+	// (see the "paused"/"resumed" events). A player's disconnect never pauses a match.
+	// RemainingMs does not run down meanwhile, and inputs are not applied.
 	Paused      bool         `json:"paused"`
 	RemainingMs int64        `json:"remainingMs"` // until the current phase deadline
 	Ack         uint64       `json:"ack"`
@@ -116,9 +117,11 @@ const (
 	EvMatchOver  = "match_over"  // Winner (-1 = no winner), Reason
 	EvPlayerLeft = "player_left" // Seat: disconnected or silent; the match goes on without them
 	EvPlayerBack = "player_back" // Seat
-	// The "paused" and "resumed" events are no longer sent. A match restored from a
-	// snapshot written by an older build may still replay them from its log in
-	// snapshot.events; clients should ignore event kinds they do not know.
+	// EvResumed ends the stand-still after a server restart or failover (State.Paused);
+	// a disconnect never causes one. There is no event for its start: a client learns it
+	// from the snapshot it gets on resuming, the only way back to a restored match. The
+	// old "paused" event is no longer sent; clients should ignore kinds they do not know.
+	EvResumed = "resumed"
 )
 
 // Event is a discrete, sequence-numbered thing that happened in a match. Events are kept

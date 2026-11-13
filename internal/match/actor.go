@@ -332,12 +332,6 @@ func (a *Actor) Detach(seat int, sink Sink) {
 	_ = a.send(context.Background(), func(now time.Time) { a.m.Detach(seat, sink, now) })
 }
 
-// SetSilent reports that a client connection has gone silent, or has been heard from
-// again. See Match.SetSilent.
-func (a *Actor) SetSilent(seat int, sink Sink, silent bool) {
-	_ = a.send(context.Background(), func(now time.Time) { a.m.SetSilent(seat, sink, silent, now) })
-}
-
 // Input queues a player action without blocking the caller (the socket reader). If the
 // seat's queue is full the input is dropped; the client sees it un-acked and may resend
 // with the same seq, which is safe because inputs are idempotent.

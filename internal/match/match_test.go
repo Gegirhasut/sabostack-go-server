@@ -320,17 +320,23 @@ func TestSnapshotRestore(t *testing.T) {
 		t.Fatalf("retransmit after restore: %s", got)
 	}
 
-	// The restored match does not wait for its players: its clocks run from the restore.
+	// The restored match waits for its players (ResyncWait), then runs from where it stood.
 	y := r.Seats[1].Board.Piece.Y
-	next := later.Add(cfg.Gravity)
+	back := later.Add(cfg.Gravity * 2)
+	r.Advance(back)
+	if !r.StateFor(0, back).Paused || r.Seats[1].Board.Piece.Y != y {
+		t.Fatalf("restored match ran before its players were back: piece y %d -> %d", y, r.Seats[1].Board.Piece.Y)
+	}
+	for i := range tokens {
+		if _, err := r.Attach(tokens[i], &fakeSink{}, 0, back); err != nil {
+			t.Fatal(err)
+		}
+	}
+	r.Advance(back)
+	next := back.Add(cfg.Gravity)
 	r.Advance(next)
 	if r.Phase != Playing || r.StateFor(0, next).Paused || r.Seats[1].Board.Piece.Y != y+1 {
 		t.Fatalf("restored match: phase=%s piece y %d -> %d, want it falling", r.Phase, y, r.Seats[1].Board.Piece.Y)
-	}
-	for i := range tokens {
-		if _, err := r.Attach(tokens[i], &fakeSink{}, 0, next); err != nil {
-			t.Fatal(err)
-		}
 	}
 	if r.ConnectedCount() != 2 || r.Input(0, 6, game.Left, next) != InputApplied {
 		t.Fatal("restored match does not take the players' inputs")

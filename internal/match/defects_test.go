@@ -306,6 +306,9 @@ func TestSnapshotMigrationFromPreviousVersion(t *testing.T) {
 	m, _ := New("old", testConfig(), [2]string{"a", "b"}, 1, t0)
 	data, _ := m.FinalSnapshot(t0)
 	old := withVersion(t, data, snapshotVersion-1)
+	registered := snapshotMigrations[snapshotVersion-1]
+	defer func() { snapshotMigrations[snapshotVersion-1] = registered }()
+	delete(snapshotMigrations, snapshotVersion-1)
 	if _, err := Restore(old, testConfig(), t0); !errors.Is(err, ErrSnapshotVersion) {
 		t.Fatalf("no migration registered: err = %v, want ErrSnapshotVersion", err)
 	}
@@ -314,7 +317,6 @@ func TestSnapshotMigrationFromPreviousVersion(t *testing.T) {
 		called = true
 		return raw, nil
 	}
-	defer delete(snapshotMigrations, snapshotVersion-1)
 	r, err := Restore(old, testConfig(), t0)
 	if err != nil || !called || r.ID != "old" {
 		t.Fatalf("restore through migration: err=%v called=%v", err, called)

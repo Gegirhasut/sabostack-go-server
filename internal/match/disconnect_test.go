@@ -1,8 +1,10 @@
 package match
 
-// The disconnect rules: the match never pauses. A disconnected player's board keeps
-// running, the opponent keeps playing, and the disconnected player either resumes within
-// the reconnect grace or forfeits. Every test runs on explicit (fake) time.
+// The disconnect rules: a disconnect never pauses the match. A disconnected player's
+// board keeps running, the opponent keeps playing, and the disconnected player either
+// resumes within the reconnect grace or forfeits. The one stand-still is the server's
+// own: a restored match waits for its players (ResyncWait). Every test runs on explicit
+// (fake) time.
 
 import (
 	"context"
@@ -299,82 +301,204 @@ func TestIdleAndGraceDoNotOverlap(t *testing.T) {
 }
 
 // A silent connection (the server has heard nothing from it) counts as away while the
-// socket stays attached; hearing from it again brings the seat back without a snapshot,
-// and if it closes later its grace still counts from the silence.
+// socket stays attached, and it is the match, on its own tick, that notices. The seat
+// comes back without a snapshot, but only once the connection has been heard from
+// steadily for SilenceTimeout/2: one stray pong from a connection that keeps stalling
+// does not bring it back (that would flap player_left/player_back). If the socket closes
+// later, the grace still counts from the silence.
 func TestSilentConnectionCountsAsAway(t *testing.T) {
 	cfg := testConfig()
-	m, _, sinks, silentAt := newPlaying(t, cfg)
-	m.SetSilent(1, sinks[1], true, silentAt)
-	if m.Seats[1].Connected || !m.Seats[1].LeftAt.Equal(silentAt) {
-		t.Fatalf("silent seat: connected=%v leftAt=%v", m.Seats[1].Connected, m.Seats[1].LeftAt)
+	cfg.Gravity = time.Hour // only presence matters here
+	m, tokens, sinks, start := newPlaying(t, cfg)
+	bob := &heardSink{}
+	bob.hear(start)
+	if _, err := m.Attach(tokens[1], bob, 0, start); err != nil {
+		t.Fatal(err)
 	}
-	if evs := sinks[0].events(); evs[len(evs)-1].Kind != protocol.EvPlayerLeft {
-		t.Fatalf("opponent's last event = %+v, want player_left", evs[len(evs)-1])
+	silence, steady := cfg.SilenceTimeout, cfg.SilenceTimeout/2
+	now, seq := start, uint64(0)
+	// step runs the match tick by tick up to until; bob is heard on the ticks hear
+	// picks. Alice plays on throughout, so only bob's presence changes.
+	step := func(until time.Time, hear func(time.Time) bool) {
+		for now.Before(until) {
+			now = now.Add(cfg.TickInterval)
+			if hear != nil && hear(now) {
+				bob.hear(now)
+			}
+			if now.Sub(start)%time.Second == 0 {
+				seq++
+				m.Input(0, seq, game.Rotate, now)
+			}
+			m.Advance(now)
+			m.Broadcast(now)
+		}
 	}
-	count := func() (n, snaps int) {
-		sinks[1].mu.Lock()
-		defer sinks[1].mu.Unlock()
-		for _, msg := range sinks[1].msgs {
-			if _, ok := msg.(protocol.Snapshot); ok {
-				snaps++
+	count := func(kind string) (n int) {
+		for _, e := range sinks[0].events() {
+			if e.Kind == kind && e.Seat != nil && *e.Seat == 1 {
+				n++
 			}
 		}
-		return len(sinks[1].msgs), snaps
+		return n
 	}
-	n, snaps := count()
-	now := silentAt.Add(cfg.Gravity)
-	m.Advance(now)
-	m.Broadcast(now)
-	if got, _ := count(); got == n {
+
+	step(start.Add(silence-cfg.TickInterval), nil)
+	if !m.Seats[1].Connected {
+		t.Fatal("bob marked away before the silence timeout")
+	}
+	step(start.Add(silence), nil)
+	silentAt := now
+	if m.Seats[1].Connected || !m.Seats[1].LeftAt.Equal(silentAt) || count(protocol.EvPlayerLeft) != 1 {
+		t.Fatalf("silent seat: connected=%v leftAt=%v player_left=%d", m.Seats[1].Connected, m.Seats[1].LeftAt, count(protocol.EvPlayerLeft))
+	}
+	n := bob.count()
+	step(now.Add(time.Second), nil)
+	if bob.count() == n {
 		t.Fatal("a silent connection stopped getting the state")
 	}
 
-	lastInput := m.Seats[1].LastInput
-	back := now.Add(3 * time.Second)
-	m.SetSilent(1, sinks[1], false, back)
-	if !m.Seats[1].Connected || !m.Seats[1].LastInput.Equal(lastInput.Add(back.Sub(silentAt))) {
-		t.Fatalf("heard again: connected=%v idle clock moved %s", m.Seats[1].Connected, m.Seats[1].LastInput.Sub(lastInput))
+	// A stall: one message, then nothing again. The seat stays away.
+	blip := now.Add(time.Second)
+	step(blip.Add(2*steady), func(t time.Time) bool { return t.Equal(blip) })
+	if m.Seats[1].Connected || count(protocol.EvPlayerBack) != 0 {
+		t.Fatal("a single message brought a stalling connection back")
 	}
-	if _, s := count(); s != snaps {
+
+	// Heard steadily again: back after SilenceTimeout/2 of it, on the same socket.
+	lastInput, snaps := m.Seats[1].LastInput, bob.snapshots()
+	run := now.Add(cfg.TickInterval)
+	for !m.Seats[1].Connected && now.Before(run.Add(time.Minute)) {
+		step(now.Add(cfg.TickInterval), func(time.Time) bool { return true })
+	}
+	if got := now.Sub(run); got != steady {
+		t.Fatalf("back %s after being heard steadily again, want %s", got, steady)
+	}
+	if got, want := m.Seats[1].LastInput.Sub(lastInput), now.Sub(silentAt); got != want {
+		t.Fatalf("idle clock moved %s on the return, want the %s away", got, want)
+	}
+	if bob.snapshots() != snaps {
 		t.Fatal("a connection heard again was sent a snapshot")
 	}
-	if evs := sinks[0].events(); evs[len(evs)-1].Kind != protocol.EvPlayerBack {
-		t.Fatalf("opponent's last event = %+v, want player_back", evs[len(evs)-1])
+	if count(protocol.EvPlayerLeft) != 1 || count(protocol.EvPlayerBack) != 1 {
+		t.Fatalf("player_left=%d player_back=%d, want one of each for one stall", count(protocol.EvPlayerLeft), count(protocol.EvPlayerBack))
 	}
 
-	m.SetSilent(1, &fakeSink{}, true, back) // a connection that is not the seat's
-	if !m.Seats[1].Connected {
-		t.Fatal("a stale connection's silence marked the seat away")
+	// Silent for good, and the socket closes later: the grace runs from the silence.
+	step(now.Add(silence), nil)
+	quiet := now
+	if m.Seats[1].Connected {
+		t.Fatal("bob not marked away the second time")
 	}
-
-	quiet := back.Add(time.Second)
-	m.SetSilent(1, sinks[1], true, quiet)
-	m.Detach(1, sinks[1], quiet.Add(5*time.Second))
+	step(quiet.Add(5*time.Second), nil)
+	m.Detach(1, bob, now)
 	if !m.Seats[1].LeftAt.Equal(quiet) {
 		t.Fatalf("grace restarted at the close: leftAt %s after the silence", m.Seats[1].LeftAt.Sub(quiet))
 	}
-	m.Advance(quiet.Add(cfg.ReconnectGrace - time.Millisecond))
+	step(quiet.Add(cfg.ReconnectGrace-cfg.TickInterval), nil)
 	if m.Phase != Playing {
 		t.Fatalf("forfeited early: %s", m.EndReason)
 	}
-	m.Advance(quiet.Add(cfg.ReconnectGrace))
+	step(quiet.Add(cfg.ReconnectGrace), nil)
 	if m.Phase != MatchEnd || m.Winner != 0 || m.EndReason != "opponent_disconnected" {
 		t.Fatalf("phase=%s winner=%d reason=%s", m.Phase, m.Winner, m.EndReason)
 	}
-	left := 0
-	for _, e := range sinks[0].events() {
-		if e.Kind == protocol.EvPlayerLeft {
-			left++
-		}
-	}
-	if left != 2 {
-		t.Fatalf("%d player_left events, want 2 (silence, silence; the close adds none)", left)
+	if count(protocol.EvPlayerLeft) != 2 {
+		t.Fatalf("%d player_left events, want 2 (two silences; the close adds none)", count(protocol.EvPlayerLeft))
 	}
 }
 
-// (f) Restoring a match with a player away: the restored match runs at once, the away
-// player keeps the grace they had left (the downtime is not counted), and the player
-// whose socket died with the process gets a full grace from the restore.
+// Bug: after a restore or a takeover both players start disconnected, and the match ran
+// on at once. A failover takes seconds, so whoever's client found the new node first
+// played on while the other's board fell: the server's failure decided rounds. Now the
+// restored match stands still (paused, inputs not applied, round time not running) until
+// both players are back, then runs from where it stood, with the idle clocks not
+// counting the wait either.
+func TestRestoredMatchWaitsForBothPlayers(t *testing.T) {
+	cfg := testConfig()
+	m, tokens, _, start := newPlaying(t, cfg)
+	m.Input(0, 1, game.Left, start)
+	now := start.Add(2 * time.Second)
+	m.Advance(now)
+	left, idle := m.PhaseEnds.Sub(now), now.Sub(m.Seats[1].LastInput)
+	data, err := m.Snapshot(now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	restoredAt := now.Add(time.Minute)
+	r, err := Restore(data, cfg, restoredAt)
+	if err != nil {
+		t.Fatal(err)
+	}
+	y := r.Seats[0].Board.Piece.Y
+	alice := &fakeSink{}
+	if _, err := r.Attach(tokens[0], alice, 0, restoredAt); err != nil {
+		t.Fatal(err)
+	}
+	if snap, _ := alice.lastSnapshot(); !snap.State.Paused || time.Duration(snap.State.RemainingMs)*time.Millisecond != left {
+		t.Fatalf("snapshot on resume: paused=%v remaining=%dms, want paused with %s left", snap.State.Paused, snap.State.RemainingMs, left)
+	}
+	back := restoredAt.Add(cfg.ResyncWait / 2)
+	for at := restoredAt; at.Before(back); at = at.Add(cfg.TickInterval) {
+		r.Advance(at)
+		st := r.StateFor(0, at)
+		if !st.Paused || time.Duration(st.RemainingMs)*time.Millisecond != left || r.Seats[0].Board.Piece.Y != y {
+			t.Fatalf("%s into the wait: paused=%v remaining=%dms piece y %d->%d", at.Sub(restoredAt), st.Paused, st.RemainingMs, y, r.Seats[0].Board.Piece.Y)
+		}
+	}
+	if got := r.Input(0, 2, game.Left, back); got != InputNotPlaying {
+		t.Fatalf("input while resyncing: %s", got)
+	}
+	if _, err := r.Attach(tokens[1], &fakeSink{}, 0, back); err != nil {
+		t.Fatal(err)
+	}
+	r.Advance(back)
+	if r.StateFor(0, back).Paused || r.PhaseEnds.Sub(back) != left {
+		t.Fatalf("both back: paused=%v round time left %s, want %s", r.StateFor(0, back).Paused, r.PhaseEnds.Sub(back), left)
+	}
+	if evs := alice.events(); evs[len(evs)-1].Kind != protocol.EvResumed {
+		t.Fatalf("last event %+v, want resumed", evs[len(evs)-1])
+	}
+	if got := back.Sub(r.Seats[1].LastInput); got != idle {
+		t.Fatalf("idle %s after the wait, want the %s it had", got, idle)
+	}
+	if got := r.Input(0, 3, game.Left, back); got != InputApplied {
+		t.Fatalf("input after the resume: %s", got)
+	}
+}
+
+// A restored match waits for its players only up to ResyncWait. A player who is not
+// back by then has the rest of their grace, counted from the restore, on a running
+// board; the one who came back plays on.
+func TestResyncWaitIsBounded(t *testing.T) {
+	cfg := testConfig()
+	m, tokens, _, start := newPlaying(t, cfg)
+	data, _ := m.Snapshot(start)
+	r, err := Restore(data, cfg, start)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := r.Attach(tokens[0], &fakeSink{}, 0, start); err != nil {
+		t.Fatal(err)
+	}
+	for at := start; !at.After(start.Add(cfg.ReconnectGrace)); at = at.Add(cfg.TickInterval) {
+		r.Advance(at)
+		if paused := r.StateFor(0, at).Paused; paused != at.Before(start.Add(cfg.ResyncWait)) {
+			t.Fatalf("%s after the restore: paused=%v", at.Sub(start), paused)
+		}
+		if r.Phase == MatchEnd {
+			if at.Sub(start) != cfg.ReconnectGrace || r.Winner != 0 || r.EndReason != "opponent_disconnected" {
+				t.Fatalf("ended %s after the restore: winner=%d reason=%s", at.Sub(start), r.Winner, r.EndReason)
+			}
+			return
+		}
+	}
+	t.Fatal("the absent player never forfeited")
+}
+
+// (f) Restoring a match with a player away: the restored match waits ResyncWait for
+// its players and then runs, the away player keeps the grace they had left (neither the
+// downtime nor the wait extends it), and the player whose socket died with the process
+// gets a full grace from the restore.
 func TestRestoreWithAwayPlayer(t *testing.T) {
 	cfg := testConfig()
 	m, tokens, sinks, start := newPlaying(t, cfg)
@@ -419,8 +543,12 @@ func TestRestoreWithAwayPlayer(t *testing.T) {
 		}
 		if now.Sub(later)%time.Second == 0 {
 			seq++
-			if got := r.Input(0, seq, game.Rotate, now); got != InputApplied {
-				t.Fatalf("input after the restore: %s", got)
+			want := InputApplied
+			if now.Before(later.Add(cfg.ResyncWait)) {
+				want = InputNotPlaying // seat 1 is not back: the match stands still
+			}
+			if got := r.Input(0, seq, game.Rotate, now); got != want {
+				t.Fatalf("input %s after the restore: %s, want %s", now.Sub(later), got, want)
 			}
 		}
 	}
@@ -430,12 +558,14 @@ func TestRestoreWithAwayPlayer(t *testing.T) {
 	}
 }
 
-// Snapshots of builds that still paused matches carry pausedAt and awayUsed. They
-// restore without them, and a match that was paused keeps the round time it had left
-// when it froze (instead of losing the frozen stretch). Nothing pauses after the restore.
-func TestRestoreIgnoresLegacyPauseFields(t *testing.T) {
+// A version-1 snapshot (from builds that paused matches on a disconnect) migrates to
+// version 2: pausedAt becomes resyncFrom, so a match that was paused keeps the round
+// time it had left when it froze, awayUsed (the pause budget) is dropped, and the idle
+// clock of an away player stands from when they left. Like any restore, the match then
+// waits for its players and runs.
+func TestRestoreMigratesVersion1Snapshot(t *testing.T) {
 	cfg := testConfig()
-	m, _, _, start := newPlaying(t, cfg)
+	m, tokens, _, start := newPlaying(t, cfg)
 	var seq uint64
 	frozeAt := start.Add(20 * time.Second)
 	for now := start; !now.After(frozeAt); now = now.Add(cfg.TickInterval) {
@@ -452,10 +582,11 @@ func TestRestoreIgnoresLegacyPauseFields(t *testing.T) {
 		t.Fatal(err)
 	}
 	pausedAt, _ := json.Marshal(frozeAt)
-	old := strings.Replace(string(data), `"nextGravity":`, `"pausedAt":`+string(pausedAt)+`,"nextGravity":`, 1)
+	old := strings.Replace(string(data), `"resyncFrom":`, `"pausedAt":`+string(pausedAt)+`,"oldResyncFrom":`, 1)
 	old = strings.ReplaceAll(old, `"lastSeq":`, `"awayUsed":12000000000,"lastSeq":`)
-	if !strings.Contains(old, `"pausedAt"`) || !strings.Contains(old, `"awayUsed"`) {
-		t.Fatal("could not build the legacy snapshot")
+	old = string(withVersion(t, []byte(old), 1))
+	if !strings.Contains(old, `"pausedAt"`) || !strings.Contains(old, `"awayUsed"`) || !strings.Contains(old, `"version":1`) {
+		t.Fatal("could not build the version-1 snapshot")
 	}
 
 	now := savedAt.Add(time.Minute)
@@ -473,13 +604,21 @@ func TestRestoreIgnoresLegacyPauseFields(t *testing.T) {
 		t.Fatalf("idle for %s, want %s", got, want)
 	}
 	again, _ := r.Snapshot(now)
-	if strings.Contains(string(again), `"pausedAt"`) || strings.Contains(string(again), `"awayUsed"`) {
-		t.Fatal("pause fields survived the restore")
+	for _, gone := range []string{`"pausedAt"`, `"awayUsed"`, `"version":1`} {
+		if strings.Contains(string(again), gone) {
+			t.Fatalf("%s survived the restore", gone)
+		}
+	}
+	for i := range tokens {
+		if _, err := r.Attach(tokens[i], &fakeSink{}, 0, now); err != nil {
+			t.Fatal(err)
+		}
 	}
 	y := r.Seats[0].Board.Piece.Y
+	r.Advance(now)
 	r.Advance(r.NextGravity)
 	if r.Phase != Playing || r.StateFor(0, r.NextGravity).Paused || r.Seats[0].Board.Piece.Y == y && r.Seats[0].Board.StackHeight() == 0 {
-		t.Fatal("restored legacy match does not run")
+		t.Fatal("restored version-1 match does not run")
 	}
 }
 
@@ -583,4 +722,25 @@ func TestTakeoverWithAwayPlayer(t *testing.T) {
 			t.Fatalf("phase=%s winner=%d reason=%s", m.Phase, m.Winner, m.EndReason)
 		}
 	})
+}
+
+// Bug: when one player's grace and the other's idle timeout ran out on the same tick, the
+// reason was "both_idle" although one of them was not even connected.
+func TestGraceAndIdleOnOneTick(t *testing.T) {
+	cfg := testConfig()
+	cfg.Gravity = time.Hour
+	m, _, sinks, start := newPlaying(t, cfg)
+	end := start.Add(cfg.IdleTimeout) // seat 0 never moves: idle from the round start
+	for now := start; !now.After(end); now = now.Add(cfg.TickInterval) {
+		if now.Equal(end.Add(-cfg.ReconnectGrace)) {
+			m.Detach(1, sinks[1], now) // seat 1's grace ends on the same tick
+		}
+		m.Advance(now)
+		if m.Phase == MatchEnd && !now.Equal(end) {
+			t.Fatalf("ended %s early: %s", end.Sub(now), m.EndReason)
+		}
+	}
+	if m.Phase != MatchEnd || m.Winner != NoSeat || m.EndReason != "disconnected_and_idle" {
+		t.Fatalf("phase=%s winner=%d reason=%s", m.Phase, m.Winner, m.EndReason)
+	}
 }

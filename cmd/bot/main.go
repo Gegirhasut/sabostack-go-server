@@ -457,9 +457,10 @@ func (b *bot) playMatch(ctx context.Context, every time.Duration) error {
 				}
 				state, haveState = next, true
 				chk.state(state)
-				// Matches never pause (state.paused is always false), so a bot plays
-				// whenever the round is on, opponent connected or not.
-				playing = state.Phase == "playing"
+				// A disconnect never pauses a match, so a bot plays whenever the round
+				// is on, opponent connected or not; only a restored match waiting for
+				// its players (paused) takes no input.
+				playing = state.Phase == "playing" && !state.Paused
 				ack(state.Ack, now)
 				continue
 			}

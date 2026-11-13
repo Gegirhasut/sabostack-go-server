@@ -32,7 +32,20 @@ type Config struct {
 	ReconnectGrace time.Duration
 	// IdleTimeout: a connected player who sends no input for this long while Playing
 	// forfeits. Only connected time counts; time away is the grace's business.
-	IdleTimeout    time.Duration
+	IdleTimeout time.Duration
+	// SilenceTimeout: a player whose connection the server has heard nothing from (no
+	// message, no pong) for this long is marked away: the reconnect grace starts and the
+	// idle clock stops. The socket stays attached, and once it has been heard from
+	// steadily for SilenceTimeout/2 (no gap of SilenceTimeout/2 or more) the seat is back.
+	// The steady part is the hysteresis: a connection that keeps stalling stays away
+	// instead of flapping away/back. 0 disables silence detection (only a closed socket
+	// counts as gone). Needs a sink that implements Heard.
+	SilenceTimeout time.Duration
+	// ResyncWait: a match restored after a restart or taken over from a dead node stands
+	// still (paused) until both players are back or this passes, so nobody loses round
+	// time to the server's failure while the clients find the new node. Each player's
+	// reconnect grace still runs from the restore. 0 = no wait.
+	ResyncWait     time.Duration
 	WinsNeeded     int // rounds needed to win the match
 	MaxRounds      int
 	EventLogSize   int // events kept for reconnect catch-up
@@ -50,6 +63,8 @@ func DefaultConfig() Config {
 		JoinTimeout:    15 * time.Second,
 		ReconnectGrace: 20 * time.Second,
 		IdleTimeout:    30 * time.Second,
+		SilenceTimeout: 8 * time.Second,
+		ResyncWait:     10 * time.Second,
 		WinsNeeded:     2,
 		MaxRounds:      3,
 		EventLogSize:   256,
@@ -62,6 +77,13 @@ func DefaultConfig() Config {
 type Sink interface {
 	Send(msg any) bool
 	Close(reason string)
+}
+
+// Heard is implemented by a sink that knows when its client last sent anything: a
+// message or a pong to the server's ping. The match polls it on every tick to notice a
+// connection that went silent (Config.SilenceTimeout).
+type Heard interface {
+	LastHeard() time.Time
 }
 
 // InputResult says what happened to a player input.
@@ -91,15 +113,17 @@ const NoSeat = -1
 type Seat struct {
 	Name      string      `json:"name"`
 	TokenHash string      `json:"tokenHash"` // sha256 of the session token; the token itself is never stored
-	Connected bool        `json:"connected"` // false while away: no connection, or a silent one (SetSilent)
-	LeftAt    time.Time   `json:"leftAt"`    // when the player went away; zero while connected
-	LastInput time.Time   `json:"lastInput"` // idle clock: last applied input, moved past time away
+	Connected bool        `json:"connected"` // false while away: no connection, or a silent one
+	LeftAt    time.Time   `json:"leftAt"`    // when the player went away (the grace runs from it); zero while connected
+	LastInput time.Time   `json:"lastInput"` // idle clock: last applied input, moved past the time the clock stood
+	IdleStop  time.Time   `json:"idleStop"`  // since when the idle clock stands (away, or the match resyncing); zero while it runs
 	LastSeq   uint64      `json:"lastSeq"`   // highest input seq consumed (idempotency)
 	Wins      int         `json:"wins"`
 	Board     *game.Board `json:"board"`
 
-	sink    Sink
-	rewound bool // restored from a non-final snapshot; cleared by the next Attach
+	sink       Sink
+	rewound    bool      // restored from a non-final snapshot; cleared by the next Attach
+	heardSince time.Time // start of the current steady run of hearing from sink (silence hysteresis)
 }
 
 // Match is the full state of one 1v1 match. Exported fields form the snapshot.
@@ -117,6 +141,10 @@ type Match struct {
 	Winner      int              `json:"winner"`
 	EndReason   string           `json:"endReason"`
 	EndedAt     time.Time        `json:"endedAt"`
+	// ResyncFrom and ResyncUntil bound the stand-still after a restore (Config.ResyncWait);
+	// both are zero while the match runs.
+	ResyncFrom  time.Time `json:"resyncFrom"`
+	ResyncUntil time.Time `json:"resyncUntil"`
 
 	cfg   Config
 	dirty bool   // state changed since the last broadcast
@@ -167,7 +195,7 @@ func (m *Match) Attach(token string, sink Sink, lastEventSeq uint64, now time.Ti
 	}
 	// The new sink is attached only after its snapshot is sent: player_back below is
 	// delivered inside the snapshot, never as a separate event ahead of it (or twice).
-	s.sink = nil
+	s.sink, s.heardSince = nil, time.Time{}
 	if !s.Connected {
 		m.back(seat, now)
 	}
@@ -187,22 +215,99 @@ func (m *Match) Attach(token string, sink Sink, lastEventSeq uint64, now time.Ti
 	return seat, nil
 }
 
+// away marks a connected seat away: its grace starts and its idle clock stops.
+func (m *Match) away(seat int, now time.Time) {
+	s := m.Seats[seat]
+	s.Connected, s.LeftAt = false, now
+	if s.IdleStop.IsZero() {
+		s.IdleStop = now
+	}
+	if m.Phase != MatchEnd {
+		m.emit(now, protocol.Event{Kind: protocol.EvPlayerLeft, Seat: intp(seat)})
+	}
+}
+
 // back marks an away seat connected again.
 func (m *Match) back(seat int, now time.Time) {
 	s := m.Seats[seat]
-	if m.Phase == Playing {
-		// Time away is not idle time (the reconnect grace covered it), so the idle clock
-		// skips it: LastInput moves forward by the part of the absence that came after it.
-		// By exactly that, never to "now": a reset gave a player who never moved a fresh
-		// idle window per reconnect. Replacing a live connection (not away) leaves it alone
-		// for the same reason.
-		if d := now.Sub(later(s.LeftAt, s.LastInput)); d > 0 {
-			s.LastInput = s.LastInput.Add(d)
-		}
-	}
 	s.Connected, s.LeftAt = true, time.Time{}
+	if !m.resyncing() {
+		m.runIdle(s, now) // while resyncing the clock stands for everyone; resync restarts it
+	}
 	if m.Phase != Waiting && m.Phase != MatchEnd {
 		m.emit(now, protocol.Event{Kind: protocol.EvPlayerBack, Seat: intp(seat)})
+	}
+}
+
+// runIdle restarts a seat's stopped idle clock. Time away is not idle time (the
+// reconnect grace covered it), nor is time the match stood still, so LastInput moves
+// forward by exactly the stretch the clock stood after it. Never to "now": a reset gave
+// a player who never moved a fresh idle window per reconnect. Replacing a live
+// connection (not away) leaves the clock alone for the same reason.
+func (m *Match) runIdle(s *Seat, now time.Time) {
+	if s.IdleStop.IsZero() {
+		return
+	}
+	if d := now.Sub(later(s.IdleStop, s.LastInput)); d > 0 {
+		s.LastInput = s.LastInput.Add(d)
+	}
+	s.IdleStop = time.Time{}
+}
+
+// resyncing reports whether the match stands still after a restore (Config.ResyncWait).
+func (m *Match) resyncing() bool { return !m.ResyncFrom.IsZero() }
+
+// resync ends the stand-still after a restore once both players are back or
+// ResyncUntil has passed, and reports whether the match runs. Every game clock (phase
+// deadline, gravity, the idle clocks of the players present) moves forward by the time
+// it stood, so the restart costs nobody round time. An absent player's grace is not
+// moved: it has run since the restore.
+func (m *Match) resync(now time.Time) bool {
+	if now.Before(m.ResyncUntil) && (!m.Seats[0].Connected || !m.Seats[1].Connected) {
+		return false
+	}
+	stood := now.Sub(m.ResyncFrom)
+	shiftTime(&m.PhaseEnds, stood)
+	shiftTime(&m.NextGravity, stood)
+	m.ResyncFrom, m.ResyncUntil = time.Time{}, time.Time{}
+	for _, s := range m.Seats {
+		if s.Connected {
+			m.runIdle(s, now)
+		}
+	}
+	m.emit(now, protocol.Event{Kind: protocol.EvResumed})
+	return true
+}
+
+// watchSilence marks away a seat whose connection has been silent for SilenceTimeout,
+// and back one that has been heard from steadily again (see Config.SilenceTimeout). It
+// runs in the actor on every tick, so it is ordered with the inputs, and it only looks
+// at the seat's current connection: a socket that closed went through Detach instead.
+func (m *Match) watchSilence(now time.Time) {
+	limit := m.cfg.SilenceTimeout
+	if limit <= 0 || m.Phase == MatchEnd {
+		return
+	}
+	for i, s := range m.Seats {
+		h, ok := s.sink.(Heard)
+		if !ok {
+			continue
+		}
+		last := h.LastHeard()
+		quiet := now.Sub(last)
+		if quiet >= limit/2 {
+			s.heardSince = time.Time{} // a gap: the steady run starts over
+		} else if s.heardSince.IsZero() {
+			s.heardSince = last
+		}
+		switch {
+		case s.Connected && quiet >= limit:
+			m.away(i, now)
+			m.touch()
+		case !s.Connected && !s.heardSince.IsZero() && now.Sub(s.heardSince) >= limit/2:
+			m.back(i, now)
+			m.touch()
+		}
 	}
 }
 
@@ -216,31 +321,7 @@ func (m *Match) Detach(seat int, sink Sink, now time.Time) {
 	}
 	s.sink = nil
 	if s.Connected {
-		s.Connected, s.LeftAt = false, now
-		if m.Phase != MatchEnd {
-			m.emit(now, protocol.Event{Kind: protocol.EvPlayerLeft, Seat: intp(seat)})
-		}
-	}
-	m.touch()
-}
-
-// SetSilent reports that the server has heard nothing from sink, the seat's connection,
-// for a while (silent) or has heard from it again. A silent seat counts as disconnected
-// for every rule: its reconnect grace runs from now, its idle clock stops, and the
-// opponent sees it as not connected. The socket stays attached meanwhile, so a client
-// that was only slow never misses a message and needs no snapshot when it is heard
-// again. A call for a sink that is not the seat's connection, or after the match, is
-// ignored.
-func (m *Match) SetSilent(seat int, sink Sink, silent bool, now time.Time) {
-	s := m.Seats[seat]
-	if sink == nil || s.sink != sink || silent == !s.Connected || m.Phase == MatchEnd {
-		return
-	}
-	if silent {
-		s.Connected, s.LeftAt = false, now
-		m.emit(now, protocol.Event{Kind: protocol.EvPlayerLeft, Seat: intp(seat)})
-	} else {
-		m.back(seat, now)
+		m.away(seat, now)
 	}
 	m.touch()
 }
@@ -258,7 +339,7 @@ func (m *Match) Input(seat int, seq uint64, a game.Action, now time.Time) InputR
 	}
 	s.LastSeq = seq
 	m.touch() // the ack changed even if nothing else did
-	if m.Phase != Playing {
+	if m.Phase != Playing || m.resyncing() {
 		return InputNotPlaying
 	}
 	s.LastInput = now
@@ -268,12 +349,17 @@ func (m *Match) Input(seat int, seq uint64, a game.Action, now time.Time) InputR
 
 // Advance runs all timers up to now. The actor calls it once per server tick.
 //
-// The match never pauses. A disconnected player's board keeps falling (pieces lock,
+// A player's disconnect never pauses the match. Their board keeps falling (pieces lock,
 // incoming garbage rises, a top-out loses the round), the round timer keeps running and
 // the opponent keeps playing. The disconnected player may resume within ReconnectGrace
-// and carries on from whatever their board is by then.
+// and carries on from whatever their board is by then. The one stand-still is the
+// server's own: after a restore the match waits up to ResyncWait for both players.
 func (m *Match) Advance(now time.Time) {
 	m.Tick++
+	m.watchSilence(now)
+	if m.resyncing() && !m.resync(now) {
+		return
+	}
 	switch m.Phase {
 	case Waiting:
 		if m.Seats[0].Connected && m.Seats[1].Connected {
@@ -323,10 +409,13 @@ func (m *Match) forfeit(now time.Time) bool {
 	}
 	switch {
 	case gone[0] && gone[1]: // nobody is playing: no winner (seat 0 used to lose by default)
-		if away[0] && away[1] {
+		switch {
+		case away[0] && away[1]:
 			m.finish(now, NoSeat, "both_disconnected")
-		} else {
+		case !away[0] && !away[1]:
 			m.finish(now, NoSeat, "both_idle")
+		default:
+			m.finish(now, NoSeat, "disconnected_and_idle")
 		}
 	case gone[0]:
 		m.finish(now, 1, forfeitReason(away[0]))
@@ -545,6 +634,10 @@ func (m *Match) StateFor(seat int, now time.Time) protocol.State {
 	}
 	if seat >= 0 {
 		st.Ack = m.Seats[seat].LastSeq
+	}
+	if m.resyncing() {
+		st.Paused = true
+		now = m.ResyncFrom // the clocks stand still: the time left is what it was
 	}
 	if m.Phase != MatchEnd {
 		st.RemainingMs = max(0, m.PhaseEnds.Sub(now).Milliseconds())
