@@ -16,7 +16,7 @@
 // A frame with the full flag set does not depend on any previous state.
 //
 //	byte    type = 0x01
-//	byte    flags: bits 0-2 phase, bit 3 paused, bit 4 full
+//	byte    flags: bits 0-2 phase, bit 3 paused (always 0 now, kept for old clients), bit 4 full
 //	svarint tick - previous tick
 //	uvarint round
 //	uvarint remainingMs

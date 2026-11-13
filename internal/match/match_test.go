@@ -215,67 +215,33 @@ func TestIdleTimeout(t *testing.T) {
 	}
 }
 
-func TestDisconnectPausesAndReconnectResumes(t *testing.T) {
-	cfg := testConfig()
-	m, tokens, sinks, now := newPlaying(t, cfg)
-	endsBefore := m.PhaseEnds
-	seenBefore := m.EventSeq
-
-	leave := now.Add(time.Second)
-	m.Detach(1, sinks[1], leave)
-	m.Advance(leave)
-	if !m.StateFor(0, leave).Paused {
-		t.Fatal("match not paused while a player is away")
-	}
-	y := m.Seats[0].Board.Piece.Y
-	back := leave.Add(10 * time.Second) // within the grace window
-	m.Advance(back)
-	if m.Phase != Playing || m.Seats[0].Board.Piece.Y != y {
-		t.Fatal("gravity ran or match ended while paused")
-	}
-
-	sink := &fakeSink{}
-	if _, err := m.Attach(tokens[1], sink, seenBefore, back); err != nil {
-		t.Fatal(err)
-	}
-	snap, ok := sink.lastSnapshot()
-	if !ok || !snap.EventsComplete || snap.Seat != 1 || snap.State.Phase != "playing" {
-		t.Fatalf("bad snapshot: %+v", snap)
-	}
-	var kinds []string
-	for _, e := range snap.Events {
-		kinds = append(kinds, e.Kind)
-	}
-	want := []string{protocol.EvPlayerLeft, protocol.EvPaused, protocol.EvPlayerBack}
-	if len(kinds) != len(want) {
-		t.Fatalf("missed events = %v, want %v", kinds, want)
-	}
-	for i := range want {
-		if kinds[i] != want[i] {
-			t.Fatalf("missed events = %v, want %v", kinds, want)
-		}
-	}
-
-	m.Advance(back)
-	if m.StateFor(0, back).Paused {
-		t.Fatal("still paused after both players are back")
-	}
-	if got := m.PhaseEnds.Sub(endsBefore); got != 10*time.Second {
-		t.Fatalf("round deadline shifted by %v, want the 10s pause", got)
-	}
-}
-
+// A player who does not come back within the grace forfeits the match, exactly when it
+// runs out, while the opponent plays on tick by tick.
 func TestReconnectGraceExpires(t *testing.T) {
 	cfg := testConfig()
-	m, _, sinks, now := newPlaying(t, cfg)
-	m.Detach(1, sinks[1], now)
-	m.Advance(now.Add(cfg.ReconnectGrace - time.Millisecond))
-	if m.Phase != Playing {
-		t.Fatalf("forfeited early: %s", m.Phase)
+	m, _, sinks, start := newPlaying(t, cfg)
+	m.Detach(1, sinks[1], start)
+	deadline := start.Add(cfg.ReconnectGrace)
+	var seq uint64
+	for now := start; now.Before(deadline); now = now.Add(cfg.TickInterval) {
+		m.Advance(now)
+		if m.Phase != Playing {
+			t.Fatalf("after %s away: phase=%s reason=%s, want playing until the grace runs out", now.Sub(start), m.Phase, m.EndReason)
+		}
+		if now.Sub(start)%time.Second == 0 {
+			seq++
+			if got := m.Input(0, seq, game.Rotate, now); got != InputApplied {
+				t.Fatalf("opponent input at %s: %s", now.Sub(start), got)
+			}
+		}
 	}
-	m.Advance(now.Add(cfg.ReconnectGrace))
+	m.Advance(deadline)
 	if m.Phase != MatchEnd || m.Winner != 0 || m.EndReason != "opponent_disconnected" {
 		t.Fatalf("phase=%s winner=%d reason=%s", m.Phase, m.Winner, m.EndReason)
+	}
+	evs := sinks[0].events()
+	if last := evs[len(evs)-1]; last.Kind != protocol.EvMatchOver || *last.Winner != 0 || last.Reason != "opponent_disconnected" {
+		t.Fatalf("opponent's last event = %+v", last)
 	}
 }
 
@@ -302,7 +268,7 @@ func TestEventLogIsBounded(t *testing.T) {
 	cfg.EventLogSize = 4
 	m, _ := New("m", cfg, [2]string{"a", "b"}, 1, t0)
 	for i := 0; i < 10; i++ {
-		m.emit(t0, protocol.Event{Kind: protocol.EvPaused})
+		m.emit(t0, protocol.Event{Kind: protocol.EvGarbage})
 	}
 	if len(m.Events) != 4 || m.Events[0].Seq != 7 {
 		t.Fatalf("log = %d events starting at %d", len(m.Events), m.Events[0].Seq)
@@ -354,18 +320,20 @@ func TestSnapshotRestore(t *testing.T) {
 		t.Fatalf("retransmit after restore: %s", got)
 	}
 
-	r.Advance(later)
-	if !r.StateFor(0, later).Paused {
-		t.Fatal("restored match should wait for players")
+	// The restored match does not wait for its players: its clocks run from the restore.
+	y := r.Seats[1].Board.Piece.Y
+	next := later.Add(cfg.Gravity)
+	r.Advance(next)
+	if r.Phase != Playing || r.StateFor(0, next).Paused || r.Seats[1].Board.Piece.Y != y+1 {
+		t.Fatalf("restored match: phase=%s piece y %d -> %d, want it falling", r.Phase, y, r.Seats[1].Board.Piece.Y)
 	}
 	for i := range tokens {
-		if _, err := r.Attach(tokens[i], &fakeSink{}, 0, later); err != nil {
+		if _, err := r.Attach(tokens[i], &fakeSink{}, 0, next); err != nil {
 			t.Fatal(err)
 		}
 	}
-	r.Advance(later)
-	if r.StateFor(0, later).Paused || r.Phase != Playing {
-		t.Fatal("restored match did not resume")
+	if r.ConnectedCount() != 2 || r.Input(0, 6, game.Left, next) != InputApplied {
+		t.Fatal("restored match does not take the players' inputs")
 	}
 }
 

@@ -199,6 +199,9 @@ func (m *Manager) LiveCount() int { return int(m.live.Load()) }
 // Store returns the snapshot store.
 func (m *Manager) Store() store.Store { return m.store }
 
+// Clock returns the clock the matches run on.
+func (m *Manager) Clock() clock.Clock { return m.clock }
+
 // Restore loads every snapshot from the store and resumes those matches that are not
 // running. It is called at startup, before the server accepts connections, and again by
 // a cluster node that got its lease back after stopping its matches.
@@ -234,8 +237,8 @@ func (m *Manager) Restore(ctx context.Context) (int, error) {
 
 // Adopt starts matches taken over from a dead node (see store.Cluster). It is Restore for
 // snapshots another process wrote: deadlines shift by the time since that node's last
-// snapshot, every seat starts disconnected and Countdown/Playing wait paused until the
-// players resume here.
+// snapshot, every seat starts disconnected, and the match runs on from the adoption
+// with each player's reconnect grace counted from it.
 func (m *Manager) Adopt(snaps map[string][]byte) int {
 	n := 0
 	for id, data := range snaps {

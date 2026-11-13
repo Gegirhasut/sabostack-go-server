@@ -20,18 +20,19 @@ import (
 
 // Config holds the match timings and rules.
 type Config struct {
-	TickInterval   time.Duration // server tick: timers are checked and state is broadcast
-	Gravity        time.Duration // the piece falls one row per Gravity
-	Countdown      time.Duration
-	RoundTime      time.Duration // round timer; on expiry the higher score wins
-	RoundEndPause  time.Duration
-	JoinTimeout    time.Duration // both players must connect within this after matchmaking
-	ReconnectGrace time.Duration // a disconnected player may come back within this
-	IdleTimeout    time.Duration // a connected player sending no input for this long forfeits
-	// PauseBudget caps the total time one player may keep the match paused by being away
-	// (summed over all disconnects). Without it a losing player could freeze the game
-	// forever by reconnecting just before the grace runs out. 0 disables the cap.
-	PauseBudget    time.Duration
+	TickInterval  time.Duration // server tick: timers are checked and state is broadcast
+	Gravity       time.Duration // the piece falls one row per Gravity
+	Countdown     time.Duration
+	RoundTime     time.Duration // round timer; on expiry the higher score wins
+	RoundEndPause time.Duration
+	JoinTimeout   time.Duration // both players must connect within this after matchmaking
+	// ReconnectGrace: a disconnected player who is not back within this forfeits. The
+	// match does not wait for them meanwhile: their board keeps falling, the round timer
+	// keeps running, and the opponent keeps playing.
+	ReconnectGrace time.Duration
+	// IdleTimeout: a connected player who sends no input for this long while Playing
+	// forfeits. Only connected time counts; time away is the grace's business.
+	IdleTimeout    time.Duration
 	WinsNeeded     int // rounds needed to win the match
 	MaxRounds      int
 	EventLogSize   int // events kept for reconnect catch-up
@@ -49,7 +50,6 @@ func DefaultConfig() Config {
 		JoinTimeout:    15 * time.Second,
 		ReconnectGrace: 20 * time.Second,
 		IdleTimeout:    30 * time.Second,
-		PauseBudget:    45 * time.Second,
 		WinsNeeded:     2,
 		MaxRounds:      3,
 		EventLogSize:   256,
@@ -70,7 +70,7 @@ type InputResult int
 const (
 	InputApplied    InputResult = iota
 	InputDuplicate              // seq <= last consumed seq: retransmit or reordered packet
-	InputNotPlaying             // valid but arrived outside the Playing phase (or while paused)
+	InputNotPlaying             // valid but arrived outside the Playing phase
 	InputInvalid                // unknown action
 )
 
@@ -89,15 +89,14 @@ const NoSeat = -1
 
 // Seat is one player's slot. Everything except the sink is persisted in snapshots.
 type Seat struct {
-	Name      string        `json:"name"`
-	TokenHash string        `json:"tokenHash"` // sha256 of the session token; the token itself is never stored
-	Connected bool          `json:"connected"`
-	LeftAt    time.Time     `json:"leftAt"`
-	LastInput time.Time     `json:"lastInput"`
-	LastSeq   uint64        `json:"lastSeq"`  // highest input seq consumed (idempotency)
-	AwayUsed  time.Duration `json:"awayUsed"` // pause time this player has caused so far
-	Wins      int           `json:"wins"`
-	Board     *game.Board   `json:"board"`
+	Name      string      `json:"name"`
+	TokenHash string      `json:"tokenHash"` // sha256 of the session token; the token itself is never stored
+	Connected bool        `json:"connected"` // false while away: no connection, or a silent one (SetSilent)
+	LeftAt    time.Time   `json:"leftAt"`    // when the player went away; zero while connected
+	LastInput time.Time   `json:"lastInput"` // idle clock: last applied input, moved past time away
+	LastSeq   uint64      `json:"lastSeq"`   // highest input seq consumed (idempotency)
+	Wins      int         `json:"wins"`
+	Board     *game.Board `json:"board"`
 
 	sink    Sink
 	rewound bool // restored from a non-final snapshot; cleared by the next Attach
@@ -112,7 +111,6 @@ type Match struct {
 	Seats       [2]*Seat         `json:"seats"`
 	PhaseEnds   time.Time        `json:"phaseEnds"`
 	NextGravity time.Time        `json:"nextGravity"`
-	PausedAt    time.Time        `json:"pausedAt"` // zero when not paused
 	Tick        uint64           `json:"tick"`
 	EventSeq    uint64           `json:"eventSeq"`
 	Events      []protocol.Event `json:"events"`
@@ -170,18 +168,8 @@ func (m *Match) Attach(token string, sink Sink, lastEventSeq uint64, now time.Ti
 	// The new sink is attached only after its snapshot is sent: player_back below is
 	// delivered inside the snapshot, never as a separate event ahead of it (or twice).
 	s.sink = nil
-	wasAway := !s.Connected
-	if wasAway && !m.PausedAt.IsZero() && (m.Phase == Countdown || m.Phase == Playing) {
-		s.AwayUsed += now.Sub(later(s.LeftAt, m.PausedAt))
-	}
-	s.Connected, s.LeftAt = true, time.Time{}
-	// LastInput is deliberately left alone. Time away is not idle time, but that is
-	// already handled: being away pauses the match and the end of the pause shifts every
-	// LastInput by the pause length (checkPause). Resetting it here as well gave a free
-	// pause-length of idle credit per reconnect, and let a player who never moved dodge
-	// the idle forfeit by opening a new socket every so often.
-	if wasAway && m.Phase != Waiting && m.Phase != MatchEnd {
-		m.emit(now, protocol.Event{Kind: protocol.EvPlayerBack, Seat: intp(seat)})
+	if !s.Connected {
+		m.back(seat, now)
 	}
 	events, complete := m.EventsSince(lastEventSeq)
 	if s.rewound {
@@ -199,16 +187,60 @@ func (m *Match) Attach(token string, sink Sink, lastEventSeq uint64, now time.Ti
 	return seat, nil
 }
 
+// back marks an away seat connected again.
+func (m *Match) back(seat int, now time.Time) {
+	s := m.Seats[seat]
+	if m.Phase == Playing {
+		// Time away is not idle time (the reconnect grace covered it), so the idle clock
+		// skips it: LastInput moves forward by the part of the absence that came after it.
+		// By exactly that, never to "now": a reset gave a player who never moved a fresh
+		// idle window per reconnect. Replacing a live connection (not away) leaves it alone
+		// for the same reason.
+		if d := now.Sub(later(s.LeftAt, s.LastInput)); d > 0 {
+			s.LastInput = s.LastInput.Add(d)
+		}
+	}
+	s.Connected, s.LeftAt = true, time.Time{}
+	if m.Phase != Waiting && m.Phase != MatchEnd {
+		m.emit(now, protocol.Event{Kind: protocol.EvPlayerBack, Seat: intp(seat)})
+	}
+}
+
 // Detach marks the seat disconnected if sink is still its current connection. A stale
-// connection closing after it was replaced is ignored.
+// connection closing after it was replaced is ignored, and so is one whose seat already
+// went silent: its reconnect grace has been running since then.
 func (m *Match) Detach(seat int, sink Sink, now time.Time) {
 	s := m.Seats[seat]
-	if s.sink != sink || !s.Connected {
+	if sink == nil || s.sink != sink {
 		return
 	}
-	s.sink, s.Connected, s.LeftAt = nil, false, now
-	if m.Phase != MatchEnd {
+	s.sink = nil
+	if s.Connected {
+		s.Connected, s.LeftAt = false, now
+		if m.Phase != MatchEnd {
+			m.emit(now, protocol.Event{Kind: protocol.EvPlayerLeft, Seat: intp(seat)})
+		}
+	}
+	m.touch()
+}
+
+// SetSilent reports that the server has heard nothing from sink, the seat's connection,
+// for a while (silent) or has heard from it again. A silent seat counts as disconnected
+// for every rule: its reconnect grace runs from now, its idle clock stops, and the
+// opponent sees it as not connected. The socket stays attached meanwhile, so a client
+// that was only slow never misses a message and needs no snapshot when it is heard
+// again. A call for a sink that is not the seat's connection, or after the match, is
+// ignored.
+func (m *Match) SetSilent(seat int, sink Sink, silent bool, now time.Time) {
+	s := m.Seats[seat]
+	if sink == nil || s.sink != sink || silent == !s.Connected || m.Phase == MatchEnd {
+		return
+	}
+	if silent {
+		s.Connected, s.LeftAt = false, now
 		m.emit(now, protocol.Event{Kind: protocol.EvPlayerLeft, Seat: intp(seat)})
+	} else {
+		m.back(seat, now)
 	}
 	m.touch()
 }
@@ -226,7 +258,7 @@ func (m *Match) Input(seat int, seq uint64, a game.Action, now time.Time) InputR
 	}
 	s.LastSeq = seq
 	m.touch() // the ack changed even if nothing else did
-	if m.Phase != Playing || !m.PausedAt.IsZero() {
+	if m.Phase != Playing {
 		return InputNotPlaying
 	}
 	s.LastInput = now
@@ -235,6 +267,11 @@ func (m *Match) Input(seat int, seq uint64, a game.Action, now time.Time) InputR
 }
 
 // Advance runs all timers up to now. The actor calls it once per server tick.
+//
+// The match never pauses. A disconnected player's board keeps falling (pieces lock,
+// incoming garbage rises, a top-out loses the round), the round timer keeps running and
+// the opponent keeps playing. The disconnected player may resume within ReconnectGrace
+// and carries on from whatever their board is by then.
 func (m *Match) Advance(now time.Time) {
 	m.Tick++
 	switch m.Phase {
@@ -244,66 +281,68 @@ func (m *Match) Advance(now time.Time) {
 		} else if !now.Before(m.PhaseEnds) {
 			m.finish(now, NoSeat, "opponent_never_joined")
 		}
-	case Countdown, Playing:
-		if m.checkPause(now) {
+	case Countdown:
+		if m.forfeit(now) {
 			return
 		}
-		if m.Phase == Countdown {
-			if !now.Before(m.PhaseEnds) {
-				m.startRound(now)
-			}
+		if !now.Before(m.PhaseEnds) {
+			m.startRound(now)
+		}
+	case Playing:
+		if m.forfeit(now) {
 			return
 		}
 		m.play(now)
 	case RoundEnd:
+		// Once the rounds played decide the match, the result stands: a player who drops
+		// in the break before it is announced cannot lose a match they have already won.
+		if _, _, decided := m.outcome(); !decided && m.forfeit(now) {
+			return
+		}
 		if !now.Before(m.PhaseEnds) {
 			m.afterRound(now)
 		}
 	}
 }
 
-// checkPause freezes Countdown/Playing while a player is disconnected (so a dropped
-// connection is not a free loss) and forfeits whoever outstays the reconnect grace.
-// It returns true while the match is paused.
-func (m *Match) checkPause(now time.Time) bool {
-	anyAway := false
-	for _, s := range m.Seats {
-		anyAway = anyAway || !s.Connected
-	}
-	if !anyAway {
-		if !m.PausedAt.IsZero() {
-			shift := now.Sub(m.PausedAt)
-			m.PhaseEnds = m.PhaseEnds.Add(shift)
-			m.NextGravity = m.NextGravity.Add(shift)
-			for _, s := range m.Seats {
-				s.LastInput = s.LastInput.Add(shift)
-			}
-			m.PausedAt = time.Time{}
-			m.emit(now, protocol.Event{Kind: protocol.EvResumed})
-		}
-		return false
-	}
-	if m.PausedAt.IsZero() {
-		m.PausedAt = now
-		m.emit(now, protocol.Event{Kind: protocol.EvPaused})
-	}
-	var expired [2]bool
+// forfeit ends the match if a player has gone: disconnected for ReconnectGrace, or (in
+// Playing) connected without an input for IdleTimeout. A seat is either connected or
+// not, so exactly one of the two clocks applies to it at any moment; they cannot both
+// fire for one player. If both players go on the same tick nobody wins. It reports
+// whether the match ended.
+func (m *Match) forfeit(now time.Time) bool {
+	var gone, away [2]bool
 	for i, s := range m.Seats {
-		if s.Connected {
-			continue
+		away[i] = !s.Connected
+		switch {
+		case away[i]:
+			gone[i] = now.Sub(s.LeftAt) >= m.cfg.ReconnectGrace
+		case m.Phase == Playing:
+			gone[i] = now.Sub(s.LastInput) >= m.cfg.IdleTimeout
 		}
-		overBudget := m.cfg.PauseBudget > 0 && s.AwayUsed+now.Sub(later(s.LeftAt, m.PausedAt)) >= m.cfg.PauseBudget
-		expired[i] = overBudget || now.Sub(s.LeftAt) >= m.cfg.ReconnectGrace
 	}
 	switch {
-	case expired[0] && expired[1]:
-		m.finish(now, NoSeat, "both_disconnected")
-	case expired[0]:
-		m.finish(now, 1, "opponent_disconnected")
-	case expired[1]:
-		m.finish(now, 0, "opponent_disconnected")
+	case gone[0] && gone[1]: // nobody is playing: no winner (seat 0 used to lose by default)
+		if away[0] && away[1] {
+			m.finish(now, NoSeat, "both_disconnected")
+		} else {
+			m.finish(now, NoSeat, "both_idle")
+		}
+	case gone[0]:
+		m.finish(now, 1, forfeitReason(away[0]))
+	case gone[1]:
+		m.finish(now, 0, forfeitReason(away[1]))
+	default:
+		return false
 	}
 	return true
+}
+
+func forfeitReason(away bool) string {
+	if away {
+		return "opponent_disconnected"
+	}
+	return "opponent_idle"
 }
 
 func later(a, b time.Time) time.Time {
@@ -313,6 +352,8 @@ func later(a, b time.Time) time.Time {
 	return b
 }
 
+// play runs gravity on both boards, whether their players are connected or not, and
+// the round timer.
 func (m *Match) play(now time.Time) {
 	// Gravity catches up if a tick ran late, but never loops unboundedly.
 	for steps := 0; !now.Before(m.NextGravity) && m.Phase == Playing && steps < 10; steps++ {
@@ -323,19 +364,6 @@ func (m *Match) play(now time.Time) {
 				return
 			}
 		}
-	}
-	idle0 := now.Sub(m.Seats[0].LastInput) >= m.cfg.IdleTimeout
-	idle1 := now.Sub(m.Seats[1].LastInput) >= m.cfg.IdleTimeout
-	switch {
-	case idle0 && idle1: // nobody is playing: no winner (seat 0 used to lose by default)
-		m.finish(now, NoSeat, "both_idle")
-		return
-	case idle0:
-		m.finish(now, 1, "opponent_idle")
-		return
-	case idle1:
-		m.finish(now, 0, "opponent_idle")
-		return
 	}
 	if !now.Before(m.PhaseEnds) {
 		a, b := m.Seats[0].Board, m.Seats[1].Board
@@ -401,27 +429,34 @@ func (m *Match) endRound(now time.Time, winner int, reason string) {
 }
 
 func (m *Match) afterRound(now time.Time) {
+	if winner, reason, decided := m.outcome(); decided {
+		m.finish(now, winner, reason)
+		return
+	}
+	m.startCountdown(now)
+}
+
+// outcome reports the match result if the rounds played so far already decide it.
+func (m *Match) outcome() (winner int, reason string, decided bool) {
 	w0, w1 := m.Seats[0].Wins, m.Seats[1].Wins
 	switch {
 	case w0 >= m.cfg.WinsNeeded:
-		m.finish(now, 0, "rounds")
+		return 0, "rounds", true
 	case w1 >= m.cfg.WinsNeeded:
-		m.finish(now, 1, "rounds")
+		return 1, "rounds", true
 	case m.Round >= m.cfg.MaxRounds && w0 > w1:
-		m.finish(now, 0, "rounds")
+		return 0, "rounds", true
 	case m.Round >= m.cfg.MaxRounds && w1 > w0:
-		m.finish(now, 1, "rounds")
+		return 1, "rounds", true
 	case m.Round >= m.cfg.MaxRounds:
-		m.finish(now, NoSeat, "draw")
-	default:
-		m.startCountdown(now)
+		return NoSeat, "draw", true
 	}
+	return NoSeat, "", false
 }
 
 func (m *Match) finish(now time.Time, winner int, reason string) {
 	m.transition(MatchEnd)
 	m.Winner, m.EndReason, m.EndedAt = winner, reason, now
-	m.PausedAt = time.Time{}
 	m.emit(now, protocol.Event{Kind: protocol.EvMatchOver, Winner: intp(winner), Reason: reason})
 }
 
@@ -506,17 +541,13 @@ func (m *Match) Broadcast(now time.Time) {
 func (m *Match) StateFor(seat int, now time.Time) protocol.State {
 	st := protocol.State{
 		Type: protocol.TypeState, Tick: m.Tick, Phase: m.Phase.String(), Round: m.Round,
-		Paused: !m.PausedAt.IsZero(), EventSeq: m.EventSeq, Players: make([]protocol.PlayerView, 2),
+		EventSeq: m.EventSeq, Players: make([]protocol.PlayerView, 2),
 	}
 	if seat >= 0 {
 		st.Ack = m.Seats[seat].LastSeq
 	}
 	if m.Phase != MatchEnd {
-		ref := now
-		if st.Paused {
-			ref = m.PausedAt
-		}
-		st.RemainingMs = max(0, m.PhaseEnds.Sub(ref).Milliseconds())
+		st.RemainingMs = max(0, m.PhaseEnds.Sub(now).Milliseconds())
 	}
 	for i, s := range m.Seats {
 		b := s.Board

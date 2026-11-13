@@ -10,6 +10,10 @@ import (
 // snapshotVersion is the format this build writes. Bump it when the snapshot's meaning
 // changes, and register a migration from the previous version in snapshotMigrations, so a
 // rolling deploy can restore and adopt the matches the old build left behind.
+//
+// Dropping the pause fields (pausedAt, awayUsed) did not need a bump: a build without
+// them ignores them in old snapshots (Restore), and a build with them reads their
+// absence as "not paused, nothing used".
 const snapshotVersion = 1
 
 // snapshotMigrations[v] turns the "match" object of a version-v snapshot into version
@@ -88,8 +92,14 @@ func (m *Match) snapshot(now time.Time, final bool) ([]byte, error) {
 //
 // Every deadline is shifted forward by the downtime, so the process being dead does not
 // eat into round or countdown time. All players start disconnected (their sockets died
-// with the old process); the normal reconnect grace then applies, and Countdown/Playing
-// stay paused until both are back.
+// with the old process) and the match runs on from now like any other: boards fall, the
+// round timer runs, and each player has the normal reconnect grace, counted from now, to
+// resume.
+//
+// Snapshots written by builds that still paused matches can carry "pausedAt" and
+// "awayUsed". Neither is a field any more and neither survives a restore. A paused
+// match's clocks stood still from pausedAt, though, so pausedAt is read once to resume
+// them from there: the round keeps the time it had left when it froze.
 func Restore(data []byte, cfg Config, now time.Time) (*Match, error) {
 	var s snapshotHeader
 	if err := json.Unmarshal(data, &s); err != nil {
@@ -114,19 +124,23 @@ func Restore(data []byte, cfg Config, now time.Time) (*Match, error) {
 	}
 	m.cfg = cfg
 	shift := now.Sub(s.SavedAt)
-	for _, t := range []*time.Time{&m.PhaseEnds, &m.NextGravity, &m.PausedAt, &m.EndedAt} {
-		shiftTime(t, shift)
+	play := shift // for the game clocks: round/countdown deadline, gravity, idle
+	var legacy struct {
+		PausedAt time.Time `json:"pausedAt"`
 	}
+	if json.Unmarshal(raw, &legacy) == nil && !legacy.PausedAt.IsZero() && legacy.PausedAt.Before(s.SavedAt) {
+		play = now.Sub(legacy.PausedAt)
+	}
+	shiftTime(&m.PhaseEnds, play)
+	shiftTime(&m.NextGravity, play)
+	shiftTime(&m.EndedAt, shift)
 	for _, seat := range m.Seats {
-		shiftTime(&seat.LastInput, shift)
+		shiftTime(&seat.LastInput, play)
 		if seat.Connected || seat.LeftAt.IsZero() {
 			seat.Connected, seat.LeftAt = false, now
 		} else {
 			shiftTime(&seat.LeftAt, shift)
 		}
-	}
-	if (m.Phase == Countdown || m.Phase == Playing) && m.PausedAt.IsZero() {
-		m.PausedAt = now // frozen until both players are back (see checkPause)
 	}
 	if !s.Final {
 		// The state rewound to this snapshot: whatever happened after it is gone. Skip the

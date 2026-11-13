@@ -63,16 +63,16 @@ func main() {
 	flag.Float64Var(&c.srv.InputRate, "input-rate", c.srv.InputRate, "client messages per second per connection (0 = unlimited)")
 	flag.Float64Var(&c.srv.InputBurst, "input-burst", c.srv.InputBurst, "burst allowance for -input-rate")
 	flag.DurationVar(&c.srv.PingInterval, "ping-interval", c.srv.PingInterval, "server WebSocket ping interval")
-	flag.DurationVar(&c.srv.PongWait, "pong-wait", c.srv.PongWait, "a silent socket is considered dead after this")
+	flag.DurationVar(&c.srv.PongWait, "pong-wait", c.srv.PongWait, "a silent socket is closed after this")
+	flag.DurationVar(&c.srv.SilenceTimeout, "silence-timeout", c.srv.SilenceTimeout, "a player silent this long (no message, no pong) is marked disconnected and the reconnect grace starts (0 = off)")
 	flag.BoolVar(&c.srv.BinaryFullFrames, "binary-full-frames", false, "send binary clients full state frames instead of deltas (for measurements)")
 	flag.DurationVar(&c.opts.Match.TickInterval, "tick", c.opts.Match.TickInterval, "server tick interval")
 	flag.DurationVar(&c.opts.Match.Gravity, "gravity", c.opts.Match.Gravity, "gravity interval")
 	flag.DurationVar(&c.opts.Match.Countdown, "countdown", c.opts.Match.Countdown, "countdown before each round")
 	flag.DurationVar(&c.opts.Match.RoundTime, "round-time", c.opts.Match.RoundTime, "round timer")
 	flag.DurationVar(&c.opts.Match.RoundEndPause, "round-end-pause", c.opts.Match.RoundEndPause, "pause between rounds")
-	flag.DurationVar(&c.opts.Match.ReconnectGrace, "reconnect-grace", c.opts.Match.ReconnectGrace, "how long a disconnected player may come back")
-	flag.DurationVar(&c.opts.Match.PauseBudget, "pause-budget", c.opts.Match.PauseBudget, "total time one player may keep a match paused by disconnecting (0 = unlimited)")
-	flag.DurationVar(&c.opts.Match.IdleTimeout, "idle-timeout", c.opts.Match.IdleTimeout, "forfeit after this long without input")
+	flag.DurationVar(&c.opts.Match.ReconnectGrace, "reconnect-grace", c.opts.Match.ReconnectGrace, "a disconnected player who is not back within this forfeits (the match never waits)")
+	flag.DurationVar(&c.opts.Match.IdleTimeout, "idle-timeout", c.opts.Match.IdleTimeout, "a connected player forfeits after this long without input")
 	flag.DurationVar(&c.opts.SnapshotEvery, "snapshot-every", c.opts.SnapshotEvery, "periodic snapshot interval")
 	flag.IntVar(&c.opts.PersistWorkers, "persist-workers", c.opts.PersistWorkers, "parallel snapshot writers")
 	flag.Parse()
@@ -140,6 +140,9 @@ func run(log *slog.Logger, c config) error {
 	}
 	if c.srv.PublicMetrics {
 		log.Warn("/metrics is served on the public address (set -admin-addr and -public-metrics=false in production)")
+	}
+	if c.srv.SilenceTimeout > 0 && c.srv.PingInterval*2 > c.srv.SilenceTimeout {
+		log.Warn("-ping-interval is over half of -silence-timeout: players who are connected but not moving will be marked disconnected")
 	}
 
 	mgr := match.NewManager(c.opts, clock.Real{}, st, met, log)

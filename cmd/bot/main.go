@@ -323,7 +323,6 @@ type serverMsg struct {
 	// state (decoded in the same pass: a real client needs the boards to draw them)
 	Tick        uint64                `json:"tick"`
 	Round       int                   `json:"round"`
-	Paused      bool                  `json:"paused"`
 	RemainingMs int64                 `json:"remainingMs"`
 	EventSeq    uint64                `json:"eventSeq"`
 	Players     []protocol.PlayerView `json:"players"`
@@ -458,7 +457,9 @@ func (b *bot) playMatch(ctx context.Context, every time.Duration) error {
 				}
 				state, haveState = next, true
 				chk.state(state)
-				playing = state.Phase == "playing" && !state.Paused
+				// Matches never pause (state.paused is always false), so a bot plays
+				// whenever the round is on, opponent connected or not.
+				playing = state.Phase == "playing"
 				ack(state.Ack, now)
 				continue
 			}
@@ -477,10 +478,10 @@ func (b *bot) playMatch(ctx context.Context, every time.Duration) error {
 				}
 			case protocol.TypeState:
 				chk.state(protocol.State{
-					Type: m.Type, Tick: m.Tick, Phase: m.Phase, Round: m.Round, Paused: m.Paused,
+					Type: m.Type, Tick: m.Tick, Phase: m.Phase, Round: m.Round,
 					RemainingMs: m.RemainingMs, Ack: m.Ack, EventSeq: m.EventSeq, Players: m.Players,
 				})
-				playing = m.Phase == "playing" && !m.Paused
+				playing = m.Phase == "playing"
 				ack(m.Ack, now)
 			case protocol.TypeSnapshot:
 				chk.snapshot(protocol.Snapshot{State: m.State, Events: m.Events, EventsComplete: m.EventsComplete})

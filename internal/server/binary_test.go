@@ -12,6 +12,7 @@ import (
 
 	"github.com/gorilla/websocket"
 
+	"github.com/Gegirhasut/sabostack-go-server/internal/clock"
 	"github.com/Gegirhasut/sabostack-go-server/internal/game"
 	"github.com/Gegirhasut/sabostack-go-server/internal/protocol"
 	"github.com/Gegirhasut/sabostack-go-server/internal/store"
@@ -140,7 +141,11 @@ func boards(st protocol.State) []protocol.PlayerView {
 // boards; inputs, acks and ping/pong work as binary frames; JSON and binary clients share
 // one match.
 func TestBinaryClientRebuildsExactStateFromDeltas(t *testing.T) {
-	ts := startServer(t, store.NewMemory())
+	opts := fastOptions()
+	opts.Match.Gravity = time.Hour // nothing moves unless a player moves it
+	cfg := DefaultConfig()
+	cfg.InputRate = 0
+	ts := startServerOn(t, store.NewMemory(), clock.Real{}, opts, cfg)
 	alice := dialBinary(t, ts.url)
 	bob := dial(t, ts.url)
 	if err := alice.ws.WriteJSON(protocol.ClientMsg{Type: protocol.TypeJoin, Name: "alice"}); err != nil {
@@ -179,11 +184,12 @@ func TestBinaryClientRebuildsExactStateFromDeltas(t *testing.T) {
 		}
 	}
 
-	// Bob drops: the match pauses and the boards freeze. Alice's delta-built state must
-	// then equal the authoritative snapshot bob gets when he comes back.
+	// Bob drops. The match goes on (it never pauses), but nobody moves and gravity is
+	// off in this test, so the boards stand still. Alice's delta-built state must then
+	// equal the authoritative snapshot bob gets when he comes back.
 	bob.ws.Close()
-	alice.waitState("pause", func(st protocol.State) bool {
-		return st.Paused && len(st.Players) == 2 && !st.Players[1].Connected
+	alice.waitState("bob away", func(st protocol.State) bool {
+		return !st.Paused && len(st.Players) == 2 && !st.Players[1].Connected
 	})
 	time.Sleep(100 * time.Millisecond) // let any last frame land
 	frozen := alice.snapshotState()

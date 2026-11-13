@@ -44,7 +44,7 @@ func TestReconnectAddsIdleCredit(t *testing.T) {
 	}
 
 	// Seat 0 keeps playing, seat 1 never sends an input. Seat 1 has been idle for all of
-	// the playing time, which excludes the pause: it forfeits at start+away+IdleTimeout.
+	// its connected time, which excludes the time away: it forfeits at start+away+IdleTimeout.
 	seq := uint64(0)
 	deadline := start.Add(away + cfg.IdleTimeout + time.Second)
 	for m.Phase == Playing && now.Before(deadline) {

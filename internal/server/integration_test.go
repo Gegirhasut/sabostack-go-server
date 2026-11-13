@@ -47,15 +47,21 @@ type testServer struct {
 
 func startServer(t *testing.T, st store.Store) *testServer {
 	t.Helper()
+	cfg := DefaultConfig()
+	cfg.InputRate = 0 // hammer() sends 200 inputs/s to end matches fast
+	return startServerOn(t, st, clock.Real{}, fastOptions(), cfg)
+}
+
+// startServerOn is startServer with a chosen clock, match options and server config.
+func startServerOn(t *testing.T, st store.Store, clk clock.Clock, opts match.Options, cfg Config) *testServer {
+	t.Helper()
 	reg := prometheus.NewRegistry()
 	met := metrics.New(reg)
 	log := slog.New(slog.NewTextHandler(io.Discard, nil))
-	mgr := match.NewManager(fastOptions(), clock.Real{}, st, met, log)
+	mgr := match.NewManager(opts, clk, st, met, log)
 	if _, err := mgr.Restore(context.Background()); err != nil {
 		t.Fatal(err)
 	}
-	cfg := DefaultConfig()
-	cfg.InputRate = 0 // hammer() sends 200 inputs/s to end matches fast
 	s := NewWithConfig(mgr, met, reg, log, cfg)
 	hs := httptest.NewServer(s.Handler())
 	ts := &testServer{srv: s, http: hs, url: "ws" + strings.TrimPrefix(hs.URL, "http") + "/ws"}
@@ -92,9 +98,18 @@ type envelope struct {
 
 func dial(t *testing.T, url string) *wsClient {
 	t.Helper()
+	return dialWith(t, url, nil)
+}
+
+// dialWith is dial with setup run on the socket before anything is read from it.
+func dialWith(t *testing.T, url string, setup func(*websocket.Conn)) *wsClient {
+	t.Helper()
 	ws, _, err := websocket.DefaultDialer.Dial(url, nil)
 	if err != nil {
 		t.Fatal(err)
+	}
+	if setup != nil {
+		setup(ws)
 	}
 	c := &wsClient{t: t, ws: ws, msgs: make(chan envelope, 4096)}
 	go func() {
@@ -218,19 +233,24 @@ func hammer(c *wsClient, stop <-chan struct{}) <-chan struct{} {
 }
 
 // TestFullMatchWithReconnect plays a whole match over real WebSockets: matchmaking,
-// countdown, a mid-round disconnect, a resume with the session token that returns the
-// missed events, and two rounds decided by top-out.
+// countdown, a mid-round disconnect during which the opponent plays on, a resume with the
+// session token that returns the missed events, and two rounds decided by top-out.
 func TestFullMatchWithReconnect(t *testing.T) {
 	ts := startServer(t, store.NewMemory())
 	alice, bob, ma, _ := joinPair(t, ts.url)
 	alice.waitFor(protocol.TypeEvent, isPhase("playing"))
 	bob.waitFor(protocol.TypeEvent, isPhase("playing"))
 
-	// Alice's connection drops mid-round.
+	// Alice's connection drops mid-round. The match does not wait for her: Bob's input
+	// still applies, and his state shows her as away.
 	seen := alice.lastEventSeq()
 	alice.ws.Close()
 	bob.waitFor(protocol.TypeEvent, isEvent(protocol.EvPlayerLeft))
-	bob.waitFor(protocol.TypeEvent, isEvent(protocol.EvPaused))
+	bob.send(protocol.ClientMsg{Type: protocol.TypeInput, Seq: 1, Action: "rotate"})
+	bob.waitFor(protocol.TypeState, func(b []byte) bool {
+		st := decode[protocol.State](t, b)
+		return st.Ack == 1 && !st.Paused && st.Phase == "playing" && !st.Players[0].Connected
+	})
 
 	// She comes back on a new socket with her token and the last event she saw.
 	alice = dial(t, ts.url)
@@ -243,10 +263,9 @@ func TestFullMatchWithReconnect(t *testing.T) {
 	for _, e := range snap.Events {
 		kinds = append(kinds, e.Kind)
 	}
-	if strings.Join(kinds, ",") != "player_left,paused,player_back" {
+	if strings.Join(kinds, ",") != "player_left,player_back" {
 		t.Fatalf("missed events = %v", kinds)
 	}
-	alice.waitFor(protocol.TypeEvent, isEvent(protocol.EvResumed))
 
 	// A wrong token is refused.
 	intruder := dial(t, ts.url)
@@ -295,9 +314,9 @@ func TestResumeAfterServerRestart(t *testing.T) {
 		t.Fatalf("restored snapshot: phase=%s ack=%d", snap.State.Phase, snap.State.Ack)
 	}
 	bob.waitFor(protocol.TypeSnapshot, nil)
-	alice.waitFor(protocol.TypeEvent, isEvent(protocol.EvResumed))
 
 	// Seq 1 was consumed before the restart, so a retransmit is ignored; seq 2 applies.
+	// The restored match runs at once: nothing waits for both players to be back.
 	alice.send(protocol.ClientMsg{Type: protocol.TypeInput, Seq: 1, Action: "hard_drop"})
 	alice.send(protocol.ClientMsg{Type: protocol.TypeInput, Seq: 2, Action: "left"})
 	alice.waitFor(protocol.TypeState, func(b []byte) bool { return decode[protocol.State](t, b).Ack == 2 })

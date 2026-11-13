@@ -78,10 +78,13 @@ type Snapshot struct {
 // State is the authoritative match state, broadcast once per server tick when something
 // changed. Ack is the highest input seq the server has consumed from the recipient.
 type State struct {
-	Type        string       `json:"type"`
-	Tick        uint64       `json:"tick"`
-	Phase       string       `json:"phase"`
-	Round       int          `json:"round"`
+	Type  string `json:"type"`
+	Tick  uint64 `json:"tick"`
+	Phase string `json:"phase"`
+	Round int    `json:"round"`
+	// Paused is always false: matches no longer pause when a player disconnects. The
+	// field (and bit 3 of a binary state frame) stays on the wire so that clients which
+	// read it keep working; new clients should ignore it.
 	Paused      bool         `json:"paused"`
 	RemainingMs int64        `json:"remainingMs"` // until the current phase deadline
 	Ack         uint64       `json:"ack"`
@@ -91,7 +94,9 @@ type State struct {
 
 // PlayerView is the public view of one seat.
 type PlayerView struct {
-	Name      string     `json:"name"`
+	Name string `json:"name"`
+	// Connected is false while the player is away (disconnected, or silent for the
+	// server's silence timeout); clients show "reconnecting" for it.
 	Connected bool       `json:"connected"`
 	Wins      int        `json:"wins"`
 	Rows      []string   `json:"rows"`
@@ -109,10 +114,11 @@ const (
 	EvGarbage    = "garbage"     // Seat, Garbage (rows that rose on Seat's board)
 	EvRoundOver  = "round_over"  // Winner (-1 = draw), Reason
 	EvMatchOver  = "match_over"  // Winner (-1 = no winner), Reason
-	EvPlayerLeft = "player_left" // Seat
+	EvPlayerLeft = "player_left" // Seat: disconnected or silent; the match goes on without them
 	EvPlayerBack = "player_back" // Seat
-	EvPaused     = "paused"
-	EvResumed    = "resumed"
+	// The "paused" and "resumed" events are no longer sent. A match restored from a
+	// snapshot written by an older build may still replay them from its log in
+	// snapshot.events; clients should ignore event kinds they do not know.
 )
 
 // Event is a discrete, sequence-numbered thing that happened in a match. Events are kept

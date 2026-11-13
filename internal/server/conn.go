@@ -7,6 +7,7 @@ import (
 	"errors"
 	"net"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/gorilla/websocket"
@@ -47,11 +48,19 @@ func (t *traffic) add(dir, format, n int) {
 type connLimits struct {
 	pingInterval time.Duration
 	pongWait     time.Duration
-	rate, burst  float64 // client messages per second (token bucket); rate 0 = unlimited
-	wireDelta    bool    // binary clients get state deltas (false: full binary frames)
+	now          func() time.Time // the match clock, for when a client was last heard from
+	rate, burst  float64          // client messages per second (token bucket); rate 0 = unlimited
+	wireDelta    bool             // binary clients get state deltas (false: full binary frames)
 	rateLimited  prometheus.Counter
 	kicked       *prometheus.CounterVec // by reason; nil in unit tests
 	traffic      *traffic
+}
+
+func (l connLimits) clock() time.Time {
+	if l.now == nil {
+		return time.Now()
+	}
+	return l.now()
 }
 
 func (l connLimits) kick(reason string) {
@@ -95,6 +104,8 @@ type client struct {
 	closeOnce sync.Once
 	reason    string
 	done      chan struct{} // writer exited
+
+	heard atomic.Int64 // match-clock UnixNano of the last frame or pong from the client
 }
 
 func newClient(ws *websocket.Conn, limits connLimits, binary bool) *client {
@@ -103,9 +114,16 @@ func newClient(ws *websocket.Conn, limits connLimits, binary bool) *client {
 		ws: ws, limits: limits, binary: binary, ctx: ctx, cancel: cancel, stateIdx: -1,
 		wake: make(chan struct{}, 1), quit: make(chan struct{}), done: make(chan struct{}),
 	}
+	c.heard.Store(limits.clock().UnixNano())
 	go c.writeLoop()
 	return c
 }
+
+// lastHeard is when the client last sent anything: a message of any kind, or a pong to
+// the server's ping. Browsers and WebSocket libraries answer pings by themselves, so a
+// live connection is heard at least once per ping interval even when the player is not
+// touching anything.
+func (c *client) lastHeard() time.Time { return time.Unix(0, c.heard.Load()) }
 
 // Send queues msg for the writer goroutine.
 func (c *client) Send(msg any) bool {
@@ -283,7 +301,10 @@ func (c *client) readLoop() <-chan protocol.ClientMsg {
 	in := make(chan protocol.ClientMsg, 16)
 	c.ws.SetReadLimit(maxMsgBytes)
 	_ = c.ws.SetReadDeadline(time.Now().Add(c.limits.pongWait))
-	c.ws.SetPongHandler(func(string) error { return c.ws.SetReadDeadline(time.Now().Add(c.limits.pongWait)) })
+	c.ws.SetPongHandler(func(string) error {
+		c.heard.Store(c.limits.clock().UnixNano())
+		return c.ws.SetReadDeadline(time.Now().Add(c.limits.pongWait))
+	})
 	var limit, abuse *bucket
 	if c.limits.rate > 0 {
 		limit = newBucket(c.limits.rate, max(1, c.limits.burst))
@@ -306,6 +327,7 @@ func (c *client) readLoop() <-chan protocol.ClientMsg {
 				}
 				return
 			}
+			c.heard.Store(c.limits.clock().UnixNano())
 			now := time.Now()
 			_ = c.ws.SetReadDeadline(now.Add(c.limits.pongWait))
 			format := fmtJSON

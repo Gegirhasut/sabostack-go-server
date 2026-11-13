@@ -148,8 +148,8 @@ func TestRestartResumesMatch(t *testing.T) {
 	}
 	clk.Advance(mgr2.opts.Match.TickInterval)
 	inspect(t, a2, func(m *Match) {
-		if !m.PausedAt.IsZero() || m.Phase != Playing {
-			t.Fatalf("match did not resume: phase=%s paused=%v", m.Phase, !m.PausedAt.IsZero())
+		if m.Phase != Playing || m.ConnectedCount() != 2 {
+			t.Fatalf("match did not resume: phase=%s connected=%d", m.Phase, m.ConnectedCount())
 		}
 	})
 }

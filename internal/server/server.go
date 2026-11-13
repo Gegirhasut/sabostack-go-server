@@ -42,8 +42,14 @@ type Config struct {
 	TrustedProxies int
 
 	HelloTimeout time.Duration // first message (join/resume) must arrive within this
-	PingInterval time.Duration // server ping frames
-	PongWait     time.Duration // a socket silent for this long is considered dead
+	PingInterval time.Duration // server ping frames; clients answer them on their own
+	PongWait     time.Duration // a socket silent for this long is closed
+	// SilenceTimeout: a client the server has heard nothing from (no message, no pong)
+	// for this long counts as gone for its match: its seat is marked disconnected and the
+	// reconnect grace starts. The socket itself stays open until PongWait, in case the
+	// client was only slow, and anything heard from it brings the seat straight back.
+	// 0 disables it.
+	SilenceTimeout time.Duration
 
 	InputRate  float64 // client messages per second per connection; 0 = unlimited
 	InputBurst float64
@@ -56,19 +62,25 @@ type Config struct {
 	BinaryFullFrames bool
 }
 
-// DefaultConfig returns safe defaults. The heartbeat keeps the original tolerant timings:
-// a 3 s ping / 10 s pong-wait was tried and, on an overloaded host, disconnected clients
-// that were merely slow to read. Tighten PingInterval/PongWait (flags) only after
-// measuring on real mobile networks; PongWait is how long a silently dropped connection
-// keeps counting as connected (and so is not paused).
+// DefaultConfig returns safe defaults.
+//
+// A silently dropped connection (half-open TCP: the phone changed networks) counts as
+// connected until the server notices, so detection has to be quicker than the 30 s idle
+// forfeit or the player loses by "idle" before their reconnect grace even starts. It is
+// done in two steps. After SilenceTimeout (8 s) without a message or a pong the seat is
+// marked away, which is cheap to undo; the socket is closed only after PongWait (30 s).
+// Closing sockets after 10 s was tried and, on an overloaded host, cut off clients that
+// were merely slow to read; marking a seat away and back costs such a client nothing.
+// Pings go out every 2 s so a live but quiet client is heard several times per window.
 func DefaultConfig() Config {
 	return Config{
-		HelloTimeout:  10 * time.Second,
-		PingInterval:  20 * time.Second,
-		PongWait:      30 * time.Second,
-		InputRate:     40,
-		InputBurst:    20,
-		PublicMetrics: true,
+		HelloTimeout:   10 * time.Second,
+		PingInterval:   2 * time.Second,
+		PongWait:       30 * time.Second,
+		SilenceTimeout: 8 * time.Second,
+		InputRate:      40,
+		InputBurst:     20,
+		PublicMetrics:  true,
 	}
 }
 
@@ -134,7 +146,7 @@ func NewWithConfig(mgr *match.Manager, met *metrics.Metrics, gatherer prometheus
 		mgr: mgr, queue: lobby.New(mgr.Create), metrics: met, gatherer: gatherer, log: log, cfg: cfg,
 		origins: map[string]bool{}, perIP: map[string]int{},
 		limits: connLimits{
-			pingInterval: cfg.PingInterval, pongWait: cfg.PongWait,
+			pingInterval: cfg.PingInterval, pongWait: cfg.PongWait, now: mgr.Clock().Now,
 			rate: cfg.InputRate, burst: cfg.InputBurst,
 			wireDelta:   !cfg.BinaryFullFrames,
 			rateLimited: met.Input("rate_limited"), kicked: met.Kicked,
@@ -384,17 +396,44 @@ func (s *Server) handleWS(w http.ResponseWriter, r *http.Request) {
 	log.Debug("player attached")
 	defer actor.Detach(seat, c)
 
-	for msg := range in {
-		switch msg.Type {
-		case protocol.TypeInput:
-			actor.Input(seat, msg.Seq, msg.Action)
-		case protocol.TypePing:
-			c.Send(protocol.Pong{Type: protocol.TypePong, T: msg.T})
-		default:
-			c.Send(errMsg("bad_request", "unexpected message type "+msg.Type))
+	// Silence watch: a client heard nothing from for SilenceTimeout is marked away in its
+	// match (the reconnect grace starts) and back as soon as it is heard again. It runs on
+	// the match clock, like the grace it starts.
+	var watch <-chan time.Time
+	if s.cfg.SilenceTimeout > 0 {
+		t := s.mgr.Clock().NewTicker(max(s.cfg.SilenceTimeout/4, time.Millisecond))
+		defer t.Stop()
+		watch = t.C()
+	}
+	silent := false
+	for {
+		select {
+		case msg, ok := <-in:
+			if !ok {
+				log.Debug("player detached")
+				return
+			}
+			if silent {
+				silent = false
+				actor.SetSilent(seat, c, false)
+			}
+			switch msg.Type {
+			case protocol.TypeInput:
+				actor.Input(seat, msg.Seq, msg.Action)
+			case protocol.TypePing:
+				c.Send(protocol.Pong{Type: protocol.TypePong, T: msg.T})
+			default:
+				c.Send(errMsg("bad_request", "unexpected message type "+msg.Type))
+			}
+		case now := <-watch:
+			// A pong does not come through in, so coming back is noticed here too.
+			if quiet := now.Sub(c.lastHeard()) >= s.cfg.SilenceTimeout; quiet != silent {
+				silent = quiet
+				log.Debug("connection silence changed", "silent", silent)
+				actor.SetSilent(seat, c, silent)
+			}
 		}
 	}
-	log.Debug("player detached")
 }
 
 // validName accepts 1-24 printable characters (runes, not bytes).

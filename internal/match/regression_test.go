@@ -77,24 +77,28 @@ func TestBugResumeEventArrivesBeforeSnapshot(t *testing.T) {
 	if evs[len(evs)-1].Kind != protocol.EvPlayerBack {
 		t.Fatalf("opponent's last event = %s, want player_back", evs[len(evs)-1].Kind)
 	}
-	m.Advance(now) // events after the attach reach the new sink
-	if evs := fresh.events(); len(evs) != 1 || evs[0].Kind != protocol.EvResumed {
-		t.Fatalf("events after attach = %+v, want [resumed]", evs)
+	m.Detach(0, sinks[0], now) // events after the attach reach the new sink
+	if evs := fresh.events(); len(evs) != 1 || evs[0].Kind != protocol.EvPlayerLeft {
+		t.Fatalf("events after attach = %+v, want [player_left]", evs)
 	}
 }
 
 // Bug: reconnecting just before the reconnect grace ran out reset it, so a losing player
 // could keep the match paused forever (measured live: 15 s of real time cost 0.25 s of
-// round time).
+// round time). The first fix capped the pause with a budget; now the match never pauses,
+// so the round clock runs on whoever is away.
 func TestBugEndlessPauseByReconnecting(t *testing.T) {
 	cfg := testConfig() // default timings: 20 s grace
 	m, tokens, sinks, now := newPlaying(t, cfg)
 	var sink Sink = sinks[1]
 	away := cfg.ReconnectGrace - time.Second // always back just in time
+	var seq uint64
 	for cycle := 0; cycle < 10 && m.Phase != MatchEnd; cycle++ {
 		m.Detach(1, sink, now)
 		for end := now.Add(away); now.Before(end) && m.Phase != MatchEnd; {
 			now = now.Add(time.Second)
+			seq++
+			m.Input(0, seq, game.Rotate, now) // the opponent keeps playing
 			m.Advance(now)
 		}
 		if m.Phase == MatchEnd {
@@ -107,8 +111,8 @@ func TestBugEndlessPauseByReconnecting(t *testing.T) {
 		sink = fresh
 		m.Advance(now)
 	}
-	// 10 cycles x 19 s = 190 s of frozen game. It must have been cut short.
-	if m.Phase != MatchEnd || m.Winner != 0 {
+	// 10 cycles x 19 s = 190 s, over twice the 90 s round: round 1 must be long over.
+	if m.Phase == Playing && m.Round == 1 {
 		t.Fatalf("after %s of pausing: phase=%s winner=%d (match frozen indefinitely)",
 			now.Sub(t0), m.Phase, m.Winner)
 	}
@@ -131,7 +135,7 @@ func TestBugSnapshotCarriesWholeEventLog(t *testing.T) {
 	cfg := testConfig() // log of 64 events
 	m, _ := New("m", cfg, [2]string{"a", "b"}, 1, t0)
 	for i := 0; i < cfg.EventLogSize; i++ {
-		m.emit(t0, protocol.Event{Kind: protocol.EvPaused})
+		m.emit(t0, protocol.Event{Kind: protocol.EvGarbage})
 	}
 	data, err := m.Snapshot(t0)
 	if err != nil {
